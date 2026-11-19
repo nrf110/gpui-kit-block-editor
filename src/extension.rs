@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
+use markdown_editor::rich::{RichDocument, RichKind, RichNode};
 use markdown_editor::{BlockKind, EditorCommand, MarkKind, TableEdit};
 
 /// An executable item in the editor's slash menu.
@@ -17,6 +18,7 @@ pub struct SlashCommand {
 pub enum CommandAction {
     Editor(EditorCommand),
     InsertMarkdown(String),
+    Collapsible,
 }
 
 #[derive(Clone, Debug)]
@@ -229,11 +231,20 @@ impl Default for CommandRegistry {
             EditorCommand::EditTable(TableEdit::RemoveColumn),
         );
         registry
+            .register(SlashCommand {
+                id: "collapsible".into(),
+                title: "Collapsible section".into(),
+                description: "Group content under an expandable title".into(),
+                keywords: vec!["toggle".into(), "details".into(), "section".into()],
+                action: CommandAction::Collapsible,
+            })
+            .expect("the built-in collapsible command ID is unique");
+        registry
     }
 }
 
-/// A native renderer for the contents of a fenced Markdown code block.
-/// Renderers receive the source only, without the opening and closing fences.
+/// A native renderer for the semantic contents of a code block.
+/// Renderers receive plain code text, independent of Markdown fences.
 pub trait PreviewExtension: Send + Sync {
     fn language(&self) -> &str;
     fn render_svg(&self, source: &str) -> Result<String>;
@@ -287,12 +298,12 @@ impl Default for ExtensionRegistry {
 }
 
 impl ExtensionRegistry {
-    /// Fence language matching and duplicate detection are ASCII case-insensitive.
+    /// Code language matching and duplicate detection are ASCII case-insensitive.
     pub fn register_preview(&mut self, extension: impl PreviewExtension + 'static) -> Result<()> {
         let language = extension.language();
         ensure!(
             !language.is_empty() && !language.chars().any(char::is_whitespace),
-            "preview language must be a nonempty fence language token"
+            "preview language must be a nonempty code language token"
         );
         ensure!(
             !self
@@ -309,81 +320,40 @@ impl ExtensionRegistry {
         Ok(())
     }
 
-    /// Render the first fenced code block whose language has a registered renderer.
-    /// Backtick and tilde fences are supported, including fences longer than three
-    /// characters and an unclosed final fence (which extends to EOF, as in Markdown).
-    /// Fences must be standalone, with at most three leading spaces; nested list or
-    /// blockquote containers are intentionally outside this section-level API.
-    pub fn render_preview(&self, markdown: &str) -> Option<Result<String>> {
-        let (extension, source) = self.preview_source(markdown)?;
-        Some(extension.render_svg(source))
+    /// Render the first semantic code block with a registered language.
+    pub fn render_preview(&self, content: &RichDocument) -> Option<Result<String>> {
+        let (extension, source) = self.preview_source(content)?;
+        Some(extension.render_svg(&source))
     }
 
-    pub(crate) fn preview_source<'a>(
+    pub(crate) fn preview_source(
         &self,
-        markdown: &'a str,
-    ) -> Option<(&Arc<dyn PreviewExtension>, &'a str)> {
-        struct OpenFence {
-            marker: u8,
-            length: usize,
-            source_start: usize,
-            preview: Option<usize>,
-        }
-        let mut open: Option<OpenFence> = None;
-        let mut offset = 0;
-        for line in markdown.split_inclusive('\n') {
-            let parts = fence_parts(line.trim_end_matches(['\r', '\n']));
-            if let Some(fence) = &open {
-                if let Some((marker, length, tail)) = parts {
-                    if marker == fence.marker && length >= fence.length && tail.trim().is_empty() {
-                        if let Some(index) = fence.preview {
-                            return Some((
-                                &self.previews[index].extension,
-                                &markdown[fence.source_start..offset],
-                            ));
+        content: &RichDocument,
+    ) -> Option<(&Arc<dyn PreviewExtension>, String)> {
+        fn find<'a, 'b>(
+            nodes: &'a [RichNode],
+            previews: &'b [RegisteredPreview],
+        ) -> Option<(&'b Arc<dyn PreviewExtension>, &'a RichNode)> {
+            for node in nodes {
+                if node.kind == RichKind::CodeBlock {
+                    if let Some(language) = node.attrs.get("lang").and_then(|value| value.as_str())
+                    {
+                        if let Some(preview) = previews
+                            .iter()
+                            .find(|entry| entry.language.eq_ignore_ascii_case(language))
+                        {
+                            return Some((&preview.extension, node));
                         }
-                        open = None;
                     }
-                }
-            } else if let Some((marker, length, info)) = parts {
-                // A backtick fence's info string may not itself contain backticks.
-                if marker != b'`' || !info.contains('`') {
-                    let language = info.split_whitespace().next().unwrap_or("");
-                    let preview = self
-                        .previews
-                        .iter()
-                        .position(|entry| entry.language.eq_ignore_ascii_case(language));
-                    open = Some(OpenFence {
-                        marker,
-                        length,
-                        source_start: offset + line.len(),
-                        preview,
-                    });
+                } else if let Some(found) = find(&node.children, previews) {
+                    return Some(found);
                 }
             }
-            offset += line.len();
+            None
         }
-        let fence = open?;
-        let index = fence.preview?;
-        Some((
-            &self.previews[index].extension,
-            &markdown[fence.source_start..],
-        ))
+        let (extension, node) = find(&content.blocks, &self.previews)?;
+        Some((extension, node.text()))
     }
-}
-
-fn fence_parts(line: &str) -> Option<(u8, usize, &str)> {
-    let indentation = line.bytes().take_while(|byte| *byte == b' ').count();
-    if indentation > 3 {
-        return None;
-    }
-    let line = &line[indentation..];
-    let marker = *line.as_bytes().first()?;
-    if marker != b'`' && marker != b'~' {
-        return None;
-    }
-    let length = line.bytes().take_while(|byte| *byte == marker).count();
-    (length >= 3).then(|| (marker, length, &line[length..]))
 }
 
 #[cfg(test)]
@@ -461,6 +431,10 @@ mod tests {
         ] {
             assert!(actions.contains(&CommandAction::Editor(command)));
         }
+        assert!(actions.contains(&CommandAction::Collapsible));
+        let commands = CommandRegistry::default().search("details toggle");
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].id, "collapsible");
     }
 
     struct ExactSource {
@@ -476,7 +450,7 @@ mod tests {
         fn render_svg(&self, source: &str) -> Result<String> {
             ensure!(
                 source == self.expected,
-                "unexpected fenced source: {source:?}"
+                "unexpected semantic code text: {source:?}"
             );
             Ok("<svg xmlns=\"http://www.w3.org/2000/svg\"><circle r=\"1\"/></svg>".into())
         }
@@ -493,13 +467,34 @@ mod tests {
         registry
     }
 
+    fn code(language: Option<&str>, text: &str) -> RichNode {
+        let mut node = RichNode::paragraph(text);
+        node.kind = RichKind::CodeBlock;
+        if let Some(language) = language {
+            node.attrs.insert("lang".into(), language.into());
+        }
+        node
+    }
+
+    fn content(blocks: Vec<RichNode>) -> RichDocument {
+        RichDocument {
+            blocks,
+            ..RichDocument::default()
+        }
+    }
+
     #[test]
-    fn custom_preview_receives_only_first_matching_fenced_body() {
+    fn custom_preview_receives_only_first_matching_semantic_body() {
         let registry = source_registry("first\n");
-        let markdown = "Prose\n```rust\nignored\n```\n```custom extra-info\nfirst\n```\n```custom\nsecond\n```\n";
+        let document = content(vec![
+            RichNode::paragraph("Prose"),
+            code(Some("rust"), "ignored\n"),
+            code(Some("custom"), "first\n"),
+            code(Some("custom"), "second\n"),
+        ]);
         assert!(
             registry
-                .render_preview(markdown)
+                .render_preview(&document)
                 .unwrap()
                 .unwrap()
                 .contains("<circle")
@@ -507,47 +502,45 @@ mod tests {
     }
 
     #[test]
-    fn supports_tilde_long_indented_and_crlf_fences() {
-        let registry = source_registry("first\r\n");
-        assert!(
-            registry
-                .render_preview("   ~~~~CUSTOM\r\nfirst\r\n  ~~~~~ \r\n")
-                .unwrap()
-                .is_ok()
-        );
-        let registry = source_registry("```\nfirst\n");
-        assert!(
-            registry
-                .render_preview("````custom\n```\nfirst\n````\n")
-                .unwrap()
-                .is_ok()
-        );
-        let registry = source_registry("first");
-        assert!(registry.render_preview("```custom\nfirst").unwrap().is_ok());
-    }
-
-    #[test]
-    fn ignores_nonfences_and_fences_inside_other_code_blocks() {
-        let registry = source_registry("unused");
-        for markdown in [
-            "custom\nfirst",
-            "inline ```custom``` text",
-            "```unknown\nfirst\n```",
-            "```\nfirst\n```",
-            "    ```custom\n    first\n    ```",
-            "```text\n~~~custom\nfirst\n~~~\n```",
-            "```custom`invalid\nfirst",
-        ] {
-            assert!(registry.render_preview(markdown).is_none(), "{markdown:?}");
+    fn semantic_code_preserves_crlf_fences_and_terminal_text() {
+        for text in ["first\r\n", "```\nfirst\n", "first"] {
+            let registry = source_registry(text);
+            let mut node = code(Some("CUSTOM"), text);
+            node.attrs.insert("meta".into(), "extra-info".into());
+            assert!(
+                registry
+                    .render_preview(&content(vec![node]))
+                    .unwrap()
+                    .is_ok()
+            );
         }
     }
 
     #[test]
-    fn closing_fence_must_match_marker_length_and_have_no_info() {
+    fn ignores_fence_like_prose_and_unknown_or_missing_languages() {
+        let registry = source_registry("unused");
+        for node in [
+            RichNode::paragraph("```custom\nfirst\n```"),
+            code(Some("unknown"), "first"),
+            code(None, "first"),
+            code(Some("text"), "~~~custom\nfirst\n~~~"),
+            code(Some("custom extra-info"), "first"),
+        ] {
+            assert!(registry.render_preview(&content(vec![node])).is_none());
+        }
+    }
+
+    #[test]
+    fn semantic_preview_discovers_nested_code_without_parsing_its_body() {
         let registry = source_registry("~~~\n``` trailing\nfirst\n");
+        let mut parent = RichNode::paragraph("");
+        parent.kind = RichKind::Quote;
+        parent
+            .children
+            .push(code(Some("custom"), "~~~\n``` trailing\nfirst\n"));
         assert!(
             registry
-                .render_preview("```custom\n~~~\n``` trailing\nfirst\n```\n")
+                .render_preview(&content(vec![parent]))
                 .unwrap()
                 .is_ok()
         );
@@ -566,7 +559,7 @@ mod tests {
         );
         assert!(
             registry
-                .render_preview("```custom\nfirst\n```\n")
+                .render_preview(&content(vec![code(Some("custom"), "first\n")]))
                 .unwrap()
                 .is_ok()
         );
@@ -585,7 +578,8 @@ mod tests {
         let CommandAction::InsertMarkdown(markdown) = command.action else {
             panic!("Mermaid inserts Markdown")
         };
-        let svg = registry.render_preview(&markdown).unwrap().unwrap();
+        let content = RichDocument::from_markdown(&markdown).unwrap();
+        let svg = registry.render_preview(&content).unwrap().unwrap();
         assert!(svg.contains("<svg"));
         assert!(svg.contains("</svg>"));
         assert!(svg.contains("Start"));
@@ -596,8 +590,11 @@ mod tests {
     #[test]
     fn invalid_mermaid_returns_an_error_and_does_not_fall_through() {
         let registry = ExtensionRegistry::default();
-        let markdown = "```mermaid\nflowchart LR\nsubgraph S\nA --> B\n```\n```mermaid\nflowchart LR\nA --> B\n```\n";
-        assert!(registry.render_preview(markdown).unwrap().is_err());
+        let document = content(vec![
+            code(Some("mermaid"), "flowchart LR\nsubgraph S\nA --> B\n"),
+            code(Some("mermaid"), "flowchart LR\nA --> B\n"),
+        ]);
+        assert!(registry.render_preview(&document).unwrap().is_err());
         assert!(MermaidExtension.render_svg("").is_err());
         assert!(MermaidExtension.render_svg("not a diagram").is_err());
     }

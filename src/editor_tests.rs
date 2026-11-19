@@ -80,8 +80,18 @@ fn slash_extension_inserts_mermaid_as_an_independent_section(cx: &mut TestAppCon
     editor.read_with(cx, |editor, _| {
         let sections = editor.document.sections();
         assert_eq!(sections.len(), 2);
-        assert!(sections[0].markdown.trim().is_empty());
-        assert!(sections[1].markdown.starts_with("```mermaid\n"));
+        assert!(sections[0].content.plain_text().trim().is_empty());
+        assert_eq!(
+            sections[1].content.blocks[0].kind,
+            crate::RichKind::CodeBlock
+        );
+        assert_eq!(
+            sections[1].content.blocks[0]
+                .attrs
+                .get("lang")
+                .and_then(serde_json::Value::as_str),
+            Some("mermaid")
+        );
         assert!(!editor.markdown().contains("/mermaid"));
     });
 }
@@ -113,7 +123,7 @@ fn dragging_a_section_reorders_without_replacing_its_source(cx: &mut TestAppCont
     editor.read_with(cx, |editor, _| {
         let sections = editor.document.sections();
         assert_eq!(sections[0].id, second);
-        assert_eq!(sections[0].markdown, "Second section");
+        assert_eq!(sections[0].content.plain_text(), "Second section");
         assert_eq!(sections[1].id, first);
     });
 }

@@ -16,6 +16,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
+use markdown_editor::rich::{RichDocument, RichKind, RichNode};
 use markdown_editor::{
     BlockEditorEvent, BlockEditorState, BlockKind as NativeBlockKind, BlockSelection,
     CapturedRange, EditOrigin, EditorCommand,
@@ -24,11 +25,11 @@ use yrs::Assoc;
 
 use crate::{
     Document, SectionId,
-    block::{BlockSpec, SectionKind},
+    block::{BlockSpec, SectionKind, specs_from_rich},
     block_markdown::parse_blocks,
     document::RelativePosition,
     extension::{CommandAction, ExtensionRegistry, SlashCommand},
-    source_map::{SelectionKind, SelectionOffsets, SourceMap},
+    rich_map::{RichMap, RichPoint, SelectionKind, SelectionOffsets},
 };
 
 /// Raw Yjs v1 updates. Remote application never echoes a local event.
@@ -41,39 +42,79 @@ struct RelativeSelection {
     kind: SelectionKind,
     anchor: RelativePosition,
     head: RelativePosition,
+    fallback: SelectionOffsets,
 }
 
 impl RelativeSelection {
     fn capture(
         document: &Document,
         id: &str,
-        map: &SourceMap,
+        content: &RichDocument,
+        map: &RichMap,
         selection: &BlockSelection,
     ) -> anyhow::Result<Self> {
         let offsets = map
             .selection_offsets(selection)
-            .context("selection has no Markdown source mapping")?;
+            .context("selection has no semantic mapping")?;
+        fn node_order(nodes: &[RichNode], id: &str, index: &mut usize) -> Option<usize> {
+            for node in nodes {
+                if node.id == id {
+                    return Some(*index);
+                }
+                *index += 1;
+                if let Some(found) = node_order(&node.children, id, index) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        let forward = if offsets.anchor.node == offsets.head.node {
+            (offsets.anchor.offset, offsets.anchor.after_atom)
+                <= (offsets.head.offset, offsets.head.after_atom)
+        } else {
+            node_order(&content.blocks, &offsets.anchor.node, &mut 0)
+                <= node_order(&content.blocks, &offsets.head.node, &mut 0)
+        };
         let (anchor_assoc, head_assoc) = if offsets.anchor == offsets.head {
             (Assoc::After, Assoc::After)
-        } else if offsets.anchor < offsets.head {
+        } else if forward {
             (Assoc::After, Assoc::Before)
         } else {
             (Assoc::Before, Assoc::After)
         };
         Ok(Self {
             kind: offsets.kind,
-            anchor: document.relative_position(id, offsets.anchor, anchor_assoc)?,
-            head: document.relative_position(id, offsets.head, head_assoc)?,
+            anchor: document.relative_position(
+                id,
+                &offsets.anchor.node,
+                offsets.anchor.offset,
+                anchor_assoc,
+            )?,
+            head: document.relative_position(
+                id,
+                &offsets.head.node,
+                offsets.head.offset,
+                head_assoc,
+            )?,
+            fallback: offsets,
         })
     }
 
-    fn resolve(&self, document: &Document, map: &SourceMap) -> Option<BlockSelection> {
-        let (_, anchor) = document.resolve_position(&self.anchor)?;
-        let (_, head) = document.resolve_position(&self.head)?;
+    fn resolve(&self, document: &Document, map: &RichMap) -> Option<BlockSelection> {
+        let point = |relative: &RelativePosition, fallback: &RichPoint| {
+            document
+                .resolve_position(relative)
+                .map(|(_, node, offset)| RichPoint {
+                    node,
+                    offset,
+                    after_atom: fallback.after_atom,
+                })
+                .unwrap_or_else(|| fallback.clone())
+        };
         map.restore_selection(SelectionOffsets {
             kind: self.kind,
-            anchor,
-            head,
+            anchor: point(&self.anchor, &self.fallback.anchor),
+            head: point(&self.head, &self.fallback.head),
         })
     }
 }
@@ -116,13 +157,13 @@ impl OpenList {
 
 struct SectionView {
     editor: Entity<BlockEditorState>,
-    source: String,
+    content: RichDocument,
     preview: Option<Arc<Image>>,
     preview_error: Option<String>,
     previewable: bool,
     show_source: bool,
     revision: u64,
-    source_map: Option<SourceMap>,
+    rich_map: Option<RichMap>,
     selection: Option<RelativeSelection>,
     native_selection: BlockSelection,
     parent: Option<SectionId>,
@@ -140,6 +181,7 @@ struct Completion {
     query: String,
     commands: Vec<SlashCommand>,
     selected: usize,
+    scroll: ScrollHandle,
 }
 
 #[derive(Clone)]
@@ -189,6 +231,7 @@ pub struct BlockEditor {
     list_starts: HashMap<SectionId, Vec<SectionId>>,
     tree: HashMap<SectionId, TreeNode>,
     tree_order: Vec<SectionId>,
+    collapsed: HashMap<SectionId, bool>,
     block_selection: HashSet<SectionId>,
     block_anchor: Option<SectionId>,
     completion: Option<Completion>,
@@ -256,6 +299,7 @@ impl BlockEditor {
             list_starts: HashMap::new(),
             tree: HashMap::new(),
             tree_order: Vec::new(),
+            collapsed: HashMap::new(),
             block_selection: HashSet::new(),
             block_anchor: None,
             completion: None,
@@ -311,7 +355,14 @@ impl BlockEditor {
         let exit_list = key.key == "enter"
             && !key.modifiers.shift
             && matches!(view.kind, SectionKind::ListItem { .. })
-            && view.source.trim().is_empty();
+            && view.content.blocks.iter().all(|node| {
+                node.kind == RichKind::Paragraph
+                    && node.children.is_empty()
+                    && node
+                        .runs
+                        .iter()
+                        .all(|run| run.atom.is_none() && run.text.trim().is_empty())
+            });
         if key.key == "enter" && !exit_list {
             return false;
         }
@@ -348,22 +399,84 @@ impl BlockEditor {
         true
     }
 
+    fn is_collapsed(&self, id: &str) -> bool {
+        let Some(TreeNode {
+            kind: SectionKind::Collapsible { default_collapsed },
+            ..
+        }) = self.tree.get(id)
+        else {
+            return false;
+        };
+        self.collapsed
+            .get(id)
+            .copied()
+            .unwrap_or(*default_collapsed)
+    }
+
+    fn toggle_collapsed(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(error) = self.flush_local_edits(window, cx) {
+            self.error = Some(error.to_string());
+            cx.notify();
+            return;
+        }
+        let collapsed = !self.is_collapsed(id);
+        if collapsed {
+            let descendant_focused = self.views.iter().any(|(candidate, view)| {
+                candidate != id
+                    && self.is_within(candidate, id)
+                    && view.editor.read(cx).focus_handle(cx).is_focused(window)
+            });
+            if descendant_focused {
+                if let Some(view) = self.views.get(id) {
+                    view.editor.update(cx, |state, cx| state.focus(window, cx));
+                }
+            }
+            if self.completion.as_ref().is_some_and(|completion| {
+                completion.section != id && self.is_within(&completion.section, id)
+            }) {
+                self.completion = None;
+            }
+        }
+        self.collapsed.insert(id.to_owned(), collapsed);
+        self.reconcile(window, cx);
+    }
+
+    fn expand_ancestors(&mut self, id: &str) -> bool {
+        let mut parent = self.tree.get(id).and_then(|node| node.parent.clone());
+        let mut changed = false;
+        while let Some(id) = parent {
+            if self.is_collapsed(&id) {
+                self.collapsed.insert(id.clone(), false);
+                changed = true;
+            }
+            parent = self.tree.get(&id).and_then(|node| node.parent.clone());
+        }
+        changed
+    }
+
     fn focus_block_at(
         &mut self,
         id: &str,
-        offset: usize,
+        point: Option<RichPoint>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
+        if self.expand_ancestors(id) {
+            self.reconcile(window, cx);
+        }
         let view = self
             .views
             .get_mut(id)
             .context("new block is not editable")?;
-        let position = view
-            .source_map
+        let map = view
+            .rich_map
             .as_ref()
-            .and_then(|map| map.position(offset, Assoc::After))
-            .context("new block caret has no source mapping")?;
+            .context("new block has no semantic mapping")?;
+        let position = point
+            .as_ref()
+            .and_then(|point| map.position(point, Assoc::After))
+            .or_else(|| map.first_position())
+            .context("new block has no editable caret")?;
         if view.previewable {
             view.show_source = true;
         }
@@ -382,20 +495,55 @@ impl BlockEditor {
     fn normalize_edit(
         &mut self,
         id: &str,
-        source: &str,
-        caret: usize,
+        content: &RichDocument,
+        caret: RichPoint,
         focused: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
-        let parsed = parse_blocks(source)?;
-        let (path, offset) = parsed
-            .locate(caret)
-            .context("split block has no editable caret target")?;
+        fn contains(nodes: &[RichNode], id: &str) -> bool {
+            nodes
+                .iter()
+                .any(|node| node.id == id || contains(&node.children, id))
+        }
+        fn locate(specs: &[BlockSpec], node: &str, path: &mut Vec<usize>) -> bool {
+            for (index, spec) in specs.iter().enumerate() {
+                path.push(index);
+                if contains(&spec.content.blocks, node) || locate(&spec.children, node, path) {
+                    return true;
+                }
+                path.pop();
+            }
+            false
+        }
+        let mut specs = specs_from_rich(content)?;
+        if matches!(self.views[id].kind, SectionKind::Collapsible { .. }) {
+            let mut roots = specs.into_iter();
+            let first = roots
+                .next()
+                .context("collapsible title has no semantic content")?;
+            let mut title = if first.kind == SectionKind::Text {
+                first
+            } else {
+                BlockSpec {
+                    kind: SectionKind::Text,
+                    content: RichDocument::paragraph("Details"),
+                    children: vec![first],
+                }
+            };
+            title.kind = self.views[id].kind.clone();
+            title.children.extend(roots);
+            specs = vec![title];
+        }
+        let mut path = Vec::new();
+        anyhow::ensure!(
+            locate(&specs, &caret.node, &mut path),
+            "split block has no semantic caret target"
+        );
         let vector = self.document.state_vector();
         self.document.begin_history_group();
         let result = (|| -> anyhow::Result<()> {
-            let identities = self.document.replace_section(id, &parsed.blocks)?;
+            let identities = self.document.replace_section(id, &specs)?;
             let target = identities
                 .into_iter()
                 .find(|(candidate, _)| *candidate == path)
@@ -403,7 +551,7 @@ impl BlockEditor {
                 .context("split block identity was not retained")?;
             self.reconcile(window, cx);
             if focused {
-                self.focus_block_at(&target, offset, window, cx)?;
+                self.focus_block_at(&target, Some(caret), window, cx)?;
             }
             self.publish(&vector, cx);
             Ok(())
@@ -459,7 +607,7 @@ impl BlockEditor {
                 } else {
                     spec = BlockSpec {
                         kind: SectionKind::ListItem { checked: None },
-                        markdown: String::new(),
+                        content: RichDocument::paragraph(""),
                         children: vec![spec],
                     };
                 }
@@ -486,11 +634,13 @@ impl BlockEditor {
         match key {
             "escape" => self.completion = None,
             "down" if !completion.commands.is_empty() => {
-                completion.selected = (completion.selected + 1) % completion.commands.len()
+                completion.selected = (completion.selected + 1) % completion.commands.len();
+                completion.scroll.scroll_to_item(completion.selected);
             }
             "up" if !completion.commands.is_empty() => {
                 completion.selected = (completion.selected + completion.commands.len() - 1)
-                    % completion.commands.len()
+                    % completion.commands.len();
+                completion.scroll.scroll_to_item(completion.selected);
             }
             "enter" | "tab" if !completion.commands.is_empty() => {
                 let index = completion.selected;
@@ -685,34 +835,33 @@ impl BlockEditor {
         if state.revision() == view.revision {
             return Ok(());
         }
-        let source = state.source();
-        let map = SourceMap::new(&source, state.model())?;
+        let content = state
+            .model()
+            .rich_document()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let map = RichMap::new(&content, state.model())?;
         let revision = state.revision();
         let native_selection = state.selection().clone();
         let composing = state.is_composing();
         let structural = {
-            let mut roots = state
-                .model()
-                .document()
-                .root()
-                .children()
-                .filter(|node| node.kind() != NativeBlockKind::Definition);
-            roots.next().is_some_and(|node| {
-                matches!(
-                    node.kind(),
-                    NativeBlockKind::List { .. } | NativeBlockKind::Blockquote
-                )
-            }) || roots.next().is_some()
+            let mut roots = content
+                .blocks
+                .iter()
+                .filter(|node| node.kind != RichKind::Definition);
+            roots
+                .next()
+                .is_some_and(|node| matches!(node.kind, RichKind::List | RichKind::Quote))
+                || roots.next().is_some()
         };
         if structural && !composing {
             let caret = map
                 .selection_offsets(&native_selection)
-                .context("split selection has no source offset")?
+                .context("split selection has no semantic position")?
                 .head;
             let focused = state.focus_handle(cx).is_focused(window);
-            return self.normalize_edit(id, &source, caret, focused, window, cx);
+            return self.normalize_edit(id, &content, caret, focused, window, cx);
         }
-        let changed = source != view.source;
+        let changed = content != view.content;
         let origin_changed = origin.is_some() && origin != view.last_origin;
         let isolated = origin.is_none_or(|origin| {
             !matches!(
@@ -737,16 +886,17 @@ impl BlockEditor {
         }
         let vector = changed.then(|| self.document.state_vector());
         if changed {
-            self.document.set_markdown(id, &source)?;
+            self.document.set_content(id, &content)?;
         }
-        let selection = RelativeSelection::capture(&self.document, id, &map, &native_selection)?;
+        let selection =
+            RelativeSelection::capture(&self.document, id, &content, &map, &native_selection)?;
         let view = self
             .views
             .get_mut(id)
             .expect("section retained during local update");
-        view.source = source;
+        view.content = content;
         view.revision = revision;
-        view.source_map = Some(map);
+        view.rich_map = Some(map);
         view.selection = Some(selection);
         view.native_selection = native_selection;
         view.last_origin = origin;
@@ -764,12 +914,13 @@ impl BlockEditor {
     fn capture_selections(&mut self, cx: &App) -> anyhow::Result<()> {
         for (id, view) in &mut self.views {
             let map = view
-                .source_map
+                .rich_map
                 .as_ref()
-                .context("section source map is unavailable")?;
+                .context("section semantic map is unavailable")?;
             view.selection = Some(RelativeSelection::capture(
                 &self.document,
                 id,
+                &view.content,
                 map,
                 view.editor.read(cx).selection(),
             )?);
@@ -786,12 +937,13 @@ impl BlockEditor {
             self.document.stop_capturing();
         }
         let map = view
-            .source_map
+            .rich_map
             .as_ref()
-            .context("section source map is unavailable")?;
+            .context("section semantic map is unavailable")?;
         view.selection = Some(RelativeSelection::capture(
             &self.document,
             id,
+            &view.content,
             map,
             state.selection(),
         )?);
@@ -940,7 +1092,22 @@ impl BlockEditor {
                 )
             })
             .collect();
-        self.block_selection.retain(|id| self.tree.contains_key(id));
+        self.collapsed.retain(|id, _| self.tree.contains_key(id));
+        if let Some((_, id)) = focused.as_ref() {
+            self.expand_ancestors(id);
+        }
+        let mut hidden = HashSet::new();
+        for id in &self.tree_order {
+            if self.tree[id]
+                .parent
+                .as_ref()
+                .is_some_and(|parent| hidden.contains(parent) || self.is_collapsed(parent))
+            {
+                hidden.insert(id.clone());
+            }
+        }
+        self.block_selection
+            .retain(|id| self.tree.contains_key(id) && !hidden.contains(id));
         if self
             .block_anchor
             .as_ref()
@@ -950,10 +1117,14 @@ impl BlockEditor {
         }
         self.order = sections
             .iter()
-            .filter(|section| section.kind.is_editable())
+            .filter(|section| section.kind.is_editable() && !hidden.contains(&section.id))
             .map(|section| section.id.clone())
             .collect();
-        self.views.retain(|id, _| self.order.contains(id));
+        self.views.retain(|id, _| {
+            self.tree
+                .get(id)
+                .is_some_and(|node| node.kind.is_editable())
+        });
         let mut changed = Vec::new();
         self.list_ends.clear();
         self.list_starts.clear();
@@ -980,7 +1151,7 @@ impl BlockEditor {
                 _ => None,
             });
             layout.insert(section.id.clone(), (section.kind.clone(), indent));
-            if matches!(section.kind, SectionKind::List { .. }) {
+            if !hidden.contains(&section.id) && matches!(section.kind, SectionKind::List { .. }) {
                 lists.push(OpenList {
                     depth: section.depth,
                     group: section.id.clone(),
@@ -991,14 +1162,16 @@ impl BlockEditor {
             if !section.kind.is_editable() {
                 continue;
             }
-            for list in &mut lists {
-                if list.last.is_none() {
-                    self.list_starts
-                        .entry(section.id.clone())
-                        .or_default()
-                        .push(list.group.clone());
+            if !hidden.contains(&section.id) {
+                for list in &mut lists {
+                    if list.last.is_none() {
+                        self.list_starts
+                            .entry(section.id.clone())
+                            .or_default()
+                            .push(list.group.clone());
+                    }
+                    list.last = Some(section.id.clone());
                 }
-                list.last = Some(section.id.clone());
             }
             let marker = if let SectionKind::ListItem { checked } = section.kind {
                 let ordinal = if let Some(parent) = &section.parent {
@@ -1027,16 +1200,16 @@ impl BlockEditor {
                 view.kind = section.kind;
                 view.indent = indent;
                 view.marker = marker;
-                if view.source != section.markdown
+                if view.content != section.content
                     || view.revision != view.editor.read(cx).revision()
                 {
                     let result = view
                         .editor
-                        .update(cx, |state, cx| -> anyhow::Result<SourceMap> {
+                        .update(cx, |state, cx| -> anyhow::Result<RichMap> {
                             state
-                                .set_source(&section.markdown, cx)
+                                .set_document(&section.content, cx)
                                 .map_err(|error| anyhow::anyhow!("{error}"))?;
-                            let map = SourceMap::new(&section.markdown, state.model())?;
+                            let map = RichMap::new(&section.content, state.model())?;
                             if let Some(selection) = view
                                 .selection
                                 .as_ref()
@@ -1050,8 +1223,8 @@ impl BlockEditor {
                         });
                     match result {
                         Ok(map) => {
-                            view.source_map = Some(map);
-                            view.source = section.markdown;
+                            view.rich_map = Some(map);
+                            view.content = section.content;
                             view.revision = view.editor.read(cx).revision();
                             view.native_selection = view.editor.read(cx).selection().clone();
                             changed.push(section.id);
@@ -1060,18 +1233,26 @@ impl BlockEditor {
                     }
                 }
             } else {
+                let mut import_error = None;
                 let editor = cx.new(|cx| {
-                    let mut state =
-                        BlockEditorState::new(window, cx).with_source(&section.markdown);
+                    let mut state = BlockEditorState::new(window, cx);
+                    if let Err(error) = state.set_document(&section.content, cx) {
+                        import_error = Some(error.to_string());
+                    }
                     state.set_scroll_handle(self.scroll.clone());
                     state
                 });
+                if let Some(error) = import_error {
+                    self.error = Some(error);
+                    continue;
+                }
                 let state = editor.read(cx);
-                let map = SourceMap::new(&section.markdown, state.model());
+                let map = RichMap::new(&section.content, state.model());
                 let (map, selection) = match map.and_then(|map| {
                     let selection = RelativeSelection::capture(
                         &self.document,
                         &section.id,
+                        &section.content,
                         &map,
                         state.selection(),
                     )?;
@@ -1114,13 +1295,13 @@ impl BlockEditor {
                     section.id.clone(),
                     SectionView {
                         editor,
-                        source: section.markdown,
+                        content: section.content,
                         preview: None,
                         preview_error: None,
                         previewable: false,
                         show_source: false,
                         revision,
-                        source_map: map,
+                        rich_map: map,
                         selection,
                         native_selection,
                         parent: section.parent,
@@ -1160,7 +1341,7 @@ impl BlockEditor {
         let Some(view) = self.views.get_mut(id) else {
             return;
         };
-        let Some((extension, source)) = self.extensions.preview_source(&view.source) else {
+        let Some((extension, source)) = self.extensions.preview_source(&view.content) else {
             view.previewable = false;
             view.preview_task = None;
             view.preview = None;
@@ -1171,7 +1352,6 @@ impl BlockEditor {
         view.preview = None;
         view.preview_error = None;
         let extension = Arc::clone(extension);
-        let source = source.to_owned();
         let section = id.to_owned();
         let render = cx.background_executor().spawn(async move {
             extension
@@ -1243,12 +1423,18 @@ impl BlockEditor {
                 .filter(|c| c.section == id && c.query == query)
                 .map_or(0, |c| c.selected);
             let commands = self.extensions.commands.search(&query);
+            let scroll = self
+                .completion
+                .as_ref()
+                .filter(|c| c.section == id && c.query == query)
+                .map_or_else(ScrollHandle::new, |c| c.scroll.clone());
             Completion {
                 section: id.to_owned(),
                 range,
                 query,
                 selected: selected.min(commands.len().saturating_sub(1)),
                 commands,
+                scroll,
             }
         });
         cx.notify();
@@ -1326,6 +1512,14 @@ impl BlockEditor {
                     self.reconcile(window, cx);
                     self.publish(&vector, cx);
                 }
+                CommandAction::Collapsible => {
+                    let vector = self.document.state_vector();
+                    let child = self.document.wrap_collapsible(&completion.section)?;
+                    self.collapsed.insert(completion.section.clone(), false);
+                    self.reconcile(window, cx);
+                    self.focus_block_at(&child, None, window, cx)?;
+                    self.publish(&vector, cx);
+                }
                 CommandAction::Editor(_) => {}
             }
             Ok(())
@@ -1339,9 +1533,18 @@ impl BlockEditor {
 
     fn menu(&self, id: &str, cx: &mut Context<Self>) -> Option<AnyElement> {
         let completion = self.completion.as_ref().filter(|c| c.section == id)?;
-        let start = completion.selected.saturating_sub(5);
         let selected = completion.selected;
-        let mut menu = div()
+        let mut items = div()
+            .id("slash-menu-items")
+            .w_full()
+            .max_h(px(320.))
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&completion.scroll)
+            .flex()
+            .flex_col()
+            .gap_1();
+        let menu = div()
             .id("slash-menu")
             .w_full()
             .max_w(px(420.))
@@ -1354,22 +1557,22 @@ impl BlockEditor {
             .text_color(cx.theme().popover_foreground)
             .flex()
             .flex_col()
-            .gap_1()
             .child(
                 div()
                     .px_2()
                     .py_1()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child("INSERT & FORMAT  ·  ↑ ↓ navigate  ·  Enter  ·  Esc"),
+                    .child("Scroll to browse · Type to filter · ↑ ↓ · Enter · Esc"),
             );
         if completion.commands.is_empty() {
-            menu = menu.child(div().p_2().child("No matching commands"));
+            items = items.child(div().p_2().child("No matching commands"));
         }
-        for (index, command) in completion.commands.iter().enumerate().skip(start).take(8) {
-            menu = menu.child(
+        for (index, command) in completion.commands.iter().enumerate() {
+            let row =
                 div()
                     .id(SharedString::from(command.id.clone()))
+                    .flex_shrink_0()
                     .px_3()
                     .py_2()
                     .rounded_md()
@@ -1387,10 +1590,20 @@ impl BlockEditor {
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .child(command.description.clone()),
-                    ),
-            );
+                    );
+            #[cfg(test)]
+            let row = {
+                use gpui_kit::test::TestSupportExt;
+                row.test_support()
+            };
+            items = items.child(row);
         }
-        Some(menu.into_any_element())
+        #[cfg(test)]
+        let items = {
+            use gpui_kit::test::TestSupportExt;
+            items.test_support()
+        };
+        Some(menu.child(items).into_any_element())
     }
 
     fn is_within(&self, id: &str, ancestor: &str) -> bool {
@@ -1526,7 +1739,9 @@ impl BlockEditor {
         roots.iter().all(|root| {
             self.tree.get(&root.id).is_some_and(|node| {
                 node.parent == root.parent
-                    && (!into_list || node.kind.is_editable())
+                    && (!into_list
+                        || (node.kind.is_editable()
+                            && !matches!(node.kind, SectionKind::Collapsible { .. })))
                     && !target
                         .parent
                         .as_ref()
@@ -1684,6 +1899,9 @@ impl Render for BlockEditor {
             let indent = view.indent;
             let parent = view.parent.clone();
             let marker = view.marker.clone();
+            let collapsible = matches!(view.kind, SectionKind::Collapsible { .. });
+            let collapsed = self.is_collapsed(&id);
+            let collapse_id = id.clone();
             let toggle_id = id.clone();
             let select_id = id.clone();
             let drag_id = id.clone();
@@ -1820,6 +2038,31 @@ impl Render for BlockEditor {
                     cx,
                 )
                 .child(grip)
+                .when(collapsible, |row| {
+                    row.child(
+                        Button::new(("toggle-collapse", index))
+                            .ghost()
+                            .small()
+                            .icon(if collapsed {
+                                IconName::ChevronRight
+                            } else {
+                                IconName::ChevronDown
+                            })
+                            .accessibility_label(if collapsed {
+                                "Expand section"
+                            } else {
+                                "Collapse section"
+                            })
+                            .tooltip(if collapsed {
+                                "Expand section"
+                            } else {
+                                "Collapse section"
+                            })
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.toggle_collapsed(&collapse_id, window, cx);
+                            })),
+                    )
+                })
                 .when_some(marker, |row, marker| {
                     row.child(
                         div()
@@ -2004,3 +2247,7 @@ mod nested_tests;
 #[cfg(test)]
 #[path = "drag_editor_tests.rs"]
 mod drag_tests;
+
+#[cfg(test)]
+#[path = "collapsible_editor_tests.rs"]
+mod collapsible_tests;

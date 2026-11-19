@@ -1,5 +1,5 @@
 use super::SectionKind;
-use super::collaboration_tests::{replica, select, setup};
+use super::collaboration_tests::{replica, select, set_text, setup};
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{AppContext, SharedString, TestAppContext};
 
@@ -17,7 +17,12 @@ fn enter_splits_a_rich_block_and_undo_restores_it(cx: &mut TestAppContext) {
         let roots = editor.document.children(None);
         assert_eq!(roots.len(), 2);
         assert_eq!(roots[0].id, id);
-        assert!(roots[1].markdown.contains("**world**"));
+        assert!(
+            roots[1].content.blocks[0]
+                .runs
+                .iter()
+                .any(|run| run.text == "world" && run.marks.bold)
+        );
         let state = editor.views[&roots[1].id].editor.read(cx);
         assert_eq!(state.model().caret().unwrap().offset, 0);
         roots[1].id.clone()
@@ -59,11 +64,11 @@ fn tab_nests_a_list_item_with_its_subtree_and_shift_tab_lifts_it(cx: &mut TestAp
         let sections = editor.document.sections();
         let two = sections
             .iter()
-            .find(|section| section.markdown == "two")
+            .find(|section| section.content.plain_text() == "two")
             .unwrap();
         let child = sections
             .iter()
-            .find(|section| section.markdown == "child")
+            .find(|section| section.content.plain_text() == "child")
             .unwrap();
         (
             two.id.clone(),
@@ -141,7 +146,7 @@ fn task_enter_creates_an_unchecked_sibling_and_empty_enter_exits(cx: &mut TestAp
                 checked: Some(false)
             }
         );
-        assert_eq!(items[1].markdown, "");
+        assert_eq!(items[1].content.plain_text(), "");
         items[1].id.clone()
     });
     cx.update_window(handle, |_, window, cx| window.press("enter", cx))
@@ -167,11 +172,11 @@ fn dragging_an_item_keeps_children_peer_text_and_undo(cx: &mut TestAppContext) {
         let sections = editor.document.sections();
         let two = sections
             .iter()
-            .find(|section| section.markdown == "two")
+            .find(|section| section.content.plain_text() == "two")
             .unwrap();
         let child = sections
             .iter()
-            .find(|section| section.markdown == "child")
+            .find(|section| section.content.plain_text() == "child")
             .unwrap();
         (
             two.id.clone(),
@@ -180,7 +185,7 @@ fn dragging_an_item_keeps_children_peer_text_and_undo(cx: &mut TestAppContext) {
         )
     });
     let vector = peer.state_vector();
-    peer.set_markdown(&two, "peer two").unwrap();
+    set_text(&mut peer, &two, "peer two");
     let update = peer.encode_update(&vector).unwrap();
     cx.update_window(handle, |_, window, cx| {
         select(&editor, &two, 0, 3, 3, window, cx);
@@ -204,7 +209,7 @@ fn dragging_an_item_keeps_children_peer_text_and_undo(cx: &mut TestAppContext) {
                 .document
                 .sections()
                 .iter()
-                .any(|section| section.id == child && section.markdown == "child")
+                .any(|section| section.id == child && section.content.plain_text() == "child")
         );
         let state = editor.views[&two].editor.read(cx);
         assert_eq!(state.source(), "peer two");
@@ -219,7 +224,7 @@ fn dragging_an_item_keeps_children_peer_text_and_undo(cx: &mut TestAppContext) {
         let items = editor.document.children(Some(&parent));
         assert_eq!(items[0].id, one);
         assert_eq!(items[1].id, two);
-        assert_eq!(items[1].markdown, "peer two");
+        assert_eq!(items[1].content.plain_text(), "peer two");
     });
 }
 
@@ -233,7 +238,7 @@ fn list_end_drop_renumbers_items_and_cross_group_drop_transfers_them(cx: &mut Te
                 .document
                 .sections()
                 .iter()
-                .find(|section| section.markdown == "other")
+                .find(|section| section.content.plain_text() == "other")
                 .unwrap()
                 .id
                 .clone(),
@@ -277,7 +282,7 @@ fn list_end_drop_renumbers_items_and_cross_group_drop_transfers_them(cx: &mut Te
                 .eq([first.as_str(), other.as_str()])
         );
         let remaining = editor.document.children(Some(&parent));
-        assert_eq!(remaining[0].markdown, "four");
+        assert_eq!(remaining[0].content.plain_text(), "four");
         assert_eq!(remaining.len(), 1);
         assert!(editor.error.is_none(), "{:?}", editor.error);
     });
@@ -301,7 +306,7 @@ fn ordinary_blocks_can_nest_and_newlines_create_siblings(cx: &mut TestAppContext
         assert_eq!(
             children
                 .iter()
-                .map(|block| block.markdown.as_str())
+                .map(|block| block.content.plain_text())
                 .collect::<Vec<_>>(),
             vec!["two", "continued"]
         );
@@ -372,7 +377,7 @@ fn enter_in_an_empty_block_creates_editable_siblings(cx: &mut TestAppContext) {
         assert_eq!(
             roots
                 .iter()
-                .map(|block| block.markdown.as_str())
+                .map(|block| block.content.plain_text())
                 .collect::<Vec<_>>(),
             vec!["", "", "text"]
         );

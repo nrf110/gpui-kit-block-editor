@@ -1,14 +1,14 @@
 //! Collaborative section storage backed by a Yjs-compatible Yrs document.
 //!
-//! Wire schema: `sections: Y.Map<UUID, Y.Map>` stores `source: Y.Text`,
-//! `kind: string`, and `position: string`. Position is one atomic register:
-//! root ranks are bare dense hexadecimal fractions; child placements are
-//! `parent-UUID|rank`. Parent and rank must never be independent registers.
-//! Missing kind means Text for existing documents. Moves retain the map and
-//! Y.Text. Projection hides orphans and breaks each concurrent parent cycle at
-//! its lexicographically smallest UUID, without rewriting collaborative state.
+//! Sections and semantic nodes are Y.Maps, node leaves are
+//! attributed Y.Texts, and each parent/rank placement is one atomic register.
+//! Markdown and JSON are explicit boundaries, never collaborative storage.
 
 use crate::block::{BlockSpec, SectionKind};
+use markdown_editor::rich::{RICH_DOCUMENT_VERSION, RichDocument};
+use serde::{Deserialize, Serialize};
+#[path = "rich_storage.rs"]
+mod rich_storage;
 use anyhow::{Result, anyhow, bail, ensure};
 use similar::{ChangeTag, TextDiff};
 use std::collections::{HashMap, HashSet};
@@ -32,11 +32,11 @@ pub type SectionId = String;
 const LOCAL_ORIGIN: &str = "section-editor/local";
 const REMOTE_ORIGIN: &str = "section-editor/remote";
 
-/// A source-text anchor that follows collaborative changes without storing a
-/// stale byte offset. Resolution never creates or restores a deleted section.
+/// An anchor into a stable semantic node. Resolution never resurrects nodes.
 #[derive(Clone, Debug)]
 pub struct RelativePosition {
     section: SectionId,
+    node: String,
     index: StickyIndex,
 }
 
@@ -44,18 +44,27 @@ impl RelativePosition {
     pub fn section(&self) -> &str {
         &self.section
     }
+    pub fn node(&self) -> &str {
+        &self.node
+    }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Section {
     pub id: SectionId,
-    pub markdown: String,
+    pub content: RichDocument,
     pub parent: Option<SectionId>,
     pub kind: SectionKind,
     pub depth: usize,
 }
 
-/// A replica of a block Markdown document. New replicas start empty.
+#[derive(Serialize, Deserialize)]
+struct JsonDocument {
+    version: u32,
+    sections: Vec<Section>,
+}
+
+/// A replica of a structured rich-text document. New replicas start empty.
 ///
 /// IDs are permanent. Concurrent moves resolve as a Y.Map register write, while
 /// edits merge inside the existing nested Y.Text. Deleted IDs are never reused.
@@ -74,7 +83,7 @@ struct Entry {
     parent: Option<SectionId>,
     kind: SectionKind,
     depth: usize,
-    source: TextRef,
+    body: MapRef,
 }
 
 impl Default for Document {
@@ -91,6 +100,9 @@ impl Document {
             ..Options::default()
         });
         let sections = doc.get_or_insert_map("sections");
+        // A common, immutable seed has the same Yjs identity on every replica.
+        // It is not a random per-peer epoch or an undoable local operation.
+        rich_storage::initialize_schema(&doc);
         // Freeze the clock inside an explicit command, so a command can span
         // queued UI events without the ordinary 500ms typing timeout splitting it.
         let history_time = Arc::new(AtomicU64::new(0));
@@ -117,14 +129,13 @@ impl Document {
     pub fn relative_position(
         &self,
         id: &str,
+        node_id: &str,
         source_byte_offset: usize,
         assoc: Assoc,
     ) -> Result<RelativePosition> {
         let txn = self.doc.transact();
         let section = self.section_map(&txn, id)?;
-        let Some(Out::YText(source)) = section.get(&txn, "source") else {
-            bail!("section {id} has no Y.Text source");
-        };
+        let source = rich_storage::node_text(&section, &txn, node_id)?;
         let text = source.get_string(&txn);
         ensure!(
             text.is_char_boundary(source_byte_offset),
@@ -142,11 +153,15 @@ impl Document {
         };
         Ok(RelativePosition {
             section: id.to_owned(),
+            node: node_id.to_owned(),
             index,
         })
     }
 
-    pub fn resolve_position(&self, position: &RelativePosition) -> Option<(SectionId, usize)> {
+    pub fn resolve_position(
+        &self,
+        position: &RelativePosition,
+    ) -> Option<(SectionId, String, usize)> {
         let txn = self.doc.transact();
         if !self
             .entries(&txn)
@@ -156,9 +171,7 @@ impl Document {
             return None;
         }
         let section = self.section_map(&txn, position.section()).ok()?;
-        let Some(Out::YText(source)) = section.get(&txn, "source") else {
-            return None;
-        };
+        let source = rich_storage::node_text(&section, &txn, position.node()).ok()?;
         let offset = position.index.get_offset(&txn)?;
         // A foreign replacement of a section/source must not resolve an anchor
         // against a different Y.Text merely because its section ID matches.
@@ -169,11 +182,12 @@ impl Document {
         let mut utf16 = 0;
         for (byte, ch) in text.char_indices() {
             if utf16 == offset.index {
-                return Some((position.section.clone(), byte));
+                return Some((position.section.clone(), position.node.clone(), byte));
             }
             utf16 += ch.len_utf16() as u32;
         }
-        (utf16 == offset.index).then(|| (position.section.clone(), text.len()))
+        (utf16 == offset.index)
+            .then(|| (position.section.clone(), position.node.clone(), text.len()))
     }
 
     pub fn undo(&mut self) -> bool {
@@ -238,7 +252,8 @@ impl Document {
             .into_iter()
             .map(|entry| Section {
                 id: entry.id,
-                markdown: entry.source.get_string(&txn),
+                content: rich_storage::read_content(&entry.body, &txn)
+                    .expect("validated semantic storage"),
                 parent: entry.parent,
                 kind: entry.kind,
                 depth: entry.depth,
@@ -260,7 +275,7 @@ impl Document {
         let blocks = if parsed.blocks.is_empty() {
             vec![BlockSpec {
                 kind: SectionKind::Text,
-                markdown: String::new(),
+                content: RichDocument::paragraph(""),
                 children: vec![],
             }]
         } else {
@@ -368,25 +383,12 @@ impl Document {
         if !retained || read_kind(&section, txn) != spec.kind {
             section.insert(txn, "kind", encode_kind(&spec.kind));
         }
-        if retained {
-            let Some(Out::YText(source)) = section.get(txn, "source") else {
-                bail!("section {id} has no Y.Text source");
-            };
-            let old = source.get_string(txn);
-            if old != spec.markdown {
-                splice_markdown(&source, txn, &old, &spec.markdown)?;
-            }
+        let body = if retained {
+            rich_storage::body(&section, txn)?
         } else {
-            section.insert(
-                txn,
-                "source",
-                TextPrelim::new(if spec.kind.is_editable() {
-                    &spec.markdown
-                } else {
-                    ""
-                }),
-            );
-        }
+            section.insert(txn, "body", MapPrelim::default())
+        };
+        rich_storage::write_content(&body, txn, &spec.content);
         paths.push((path.clone(), id.clone()));
         let mut previous = if retained {
             self.entries(txn)
@@ -407,31 +409,46 @@ impl Document {
         Ok(id)
     }
 
-    /// Apply disjoint character splices, preserving unchanged Y.Text identities
-    /// even between formatting delimiters added/removed in the same command.
+    /// Markdown is an explicit import boundary. Retain matching node identities
+    /// where possible so boundary callers do not replace an unchanged text leaf.
     pub fn set_markdown(&mut self, id: &str, markdown: &str) -> Result<()> {
-        let (source, old) = {
+        let mut content =
+            RichDocument::from_markdown(markdown).map_err(|error| anyhow!("{error}"))?;
+        let old = self
+            .sections()
+            .into_iter()
+            .find(|section| section.id == id)
+            .ok_or_else(|| anyhow!("unknown section: {id}"))?
+            .content;
+        rich_storage::retain_boundary_ids(&old, &mut content);
+        self.set_content(id, &content)
+    }
+
+    pub fn set_content(&mut self, id: &str, content: &RichDocument) -> Result<()> {
+        content.validate().map_err(|error| anyhow!("{error}"))?;
+        let body = {
             let txn = self.doc.transact();
             let section = self.section_map(&txn, id)?;
             ensure!(
                 read_kind(&section, &txn).is_editable(),
                 "cannot edit a structural container"
             );
-            let Some(Out::YText(source)) = section.get(&txn, "source") else {
-                bail!("section {id} has no Y.Text source");
-            };
-            let old = source.get_string(&txn);
-            (source, old)
+            let body = rich_storage::body(&section, &txn)?;
+            if rich_storage::read_content(&body, &txn)? == *content {
+                return Ok(());
+            }
+            body
         };
-        if old == markdown {
-            return Ok(());
-        }
         if self.history_group_depth == 0 && self.typing_section.as_deref() != Some(id) {
             self.stop_capturing();
             self.typing_section = Some(id.to_owned());
         }
-        let mut txn = self.doc.transact_mut_with(LOCAL_ORIGIN);
-        splice_markdown(&source, &mut txn, &old, markdown)
+        rich_storage::write_content(
+            &body,
+            &mut self.doc.transact_mut_with(LOCAL_ORIGIN),
+            content,
+        );
+        Ok(())
     }
 
     /// Reorder within the current parent; cross-group targets are rejected.
@@ -616,7 +633,7 @@ impl Document {
                         None,
                         &BlockSpec {
                             kind: group.kind.clone(),
-                            markdown: String::new(),
+                            content: RichDocument::default(),
                             children: vec![],
                         },
                     )?,
@@ -686,7 +703,7 @@ impl Document {
             .find(|section| section.id == id)
             .ok_or_else(|| anyhow!("unknown section: {id}"))?;
         if !matches!(item.kind, SectionKind::ListItem { .. })
-            || (empty_only && !item.markdown.trim().is_empty())
+            || (empty_only && !item.content.plain_text().trim().is_empty())
         {
             return Ok(false);
         }
@@ -732,7 +749,7 @@ impl Document {
                     before.as_deref(),
                     &BlockSpec {
                         kind,
-                        markdown: String::new(),
+                        content: RichDocument::default(),
                         children: vec![],
                     },
                 )?;
@@ -783,8 +800,11 @@ impl Document {
                 validate_kind_child(&kind, &child.kind)?;
             }
             ensure!(
-                kind.is_editable() || entry.source.get_string(&txn).is_empty(),
-                "container source must be empty"
+                kind.is_editable()
+                    || rich_storage::read_content(&entry.body, &txn)?
+                        .plain_text()
+                        .is_empty(),
+                "container text must be empty"
             );
             document
                 .section_map(&txn, id)?
@@ -835,7 +855,7 @@ impl Document {
                 Some(id),
                 &BlockSpec {
                     kind: SectionKind::List { ordered, start: 1 },
-                    markdown: String::new(),
+                    content: RichDocument::default(),
                     children: vec![],
                 },
             )?;
@@ -886,7 +906,7 @@ impl Document {
                         before.as_deref(),
                         &BlockSpec {
                             kind: SectionKind::Quote,
-                            markdown: String::new(),
+                            content: RichDocument::default(),
                             children: vec![],
                         },
                     )?;
@@ -900,7 +920,7 @@ impl Document {
                     Some(id),
                     &BlockSpec {
                         kind: SectionKind::Quote,
-                        markdown: String::new(),
+                        content: RichDocument::default(),
                         children: vec![],
                     },
                 )?;
@@ -908,6 +928,119 @@ impl Document {
             }
             Ok(())
         })
+    }
+
+    /// Retain the title and its subtree, and add an initial typing child.
+    pub fn wrap_collapsible(&mut self, id: &str) -> Result<SectionId> {
+        let section = self
+            .sections()
+            .into_iter()
+            .find(|section| section.id == id)
+            .ok_or_else(|| anyhow!("unknown section: {id}"))?;
+        ensure!(
+            section.kind == SectionKind::Text,
+            "only editable text can become a collapsible"
+        );
+        self.command(|document| {
+            if section.content.plain_text().trim().is_empty() {
+                let mut content = RichDocument::paragraph("Details");
+                rich_storage::retain_boundary_ids(&section.content, &mut content);
+                document.set_content(id, &content)?;
+            }
+            document.set_kind(
+                id,
+                SectionKind::Collapsible {
+                    default_collapsed: true,
+                },
+            )?;
+            let before = document
+                .children(Some(id))
+                .first()
+                .map(|child| child.id.clone());
+            document.insert_block(
+                Some(id),
+                before.as_deref(),
+                &BlockSpec {
+                    kind: SectionKind::Text,
+                    content: RichDocument::paragraph(""),
+                    children: vec![],
+                },
+            )
+        })
+    }
+
+    pub fn export_json(&self) -> Result<String> {
+        Ok(serde_json::to_string(&JsonDocument {
+            version: RICH_DOCUMENT_VERSION,
+            sections: self.sections(),
+        })?)
+    }
+
+    pub fn import_json(json: &str) -> Result<Self> {
+        let input: JsonDocument = serde_json::from_str(json)?;
+        ensure!(
+            input.version == RICH_DOCUMENT_VERSION,
+            "unsupported JSON document version"
+        );
+        Self::from_sections(input.sections)
+    }
+
+    fn from_sections(sections: Vec<Section>) -> Result<Self> {
+        let mut known = HashMap::new();
+        for section in &sections {
+            ensure!(!section.id.is_empty(), "empty section ID");
+            ensure!(
+                known.insert(section.id.as_str(), section).is_none(),
+                "duplicate section ID"
+            );
+            section
+                .content
+                .validate()
+                .map_err(|error| anyhow!("{error}"))?;
+            ensure!(
+                section.kind.is_editable() || section.content.plain_text().is_empty(),
+                "container text must be empty"
+            );
+        }
+        for section in &sections {
+            if let Some(parent) = section.parent.as_deref() {
+                let owner = known
+                    .get(parent)
+                    .ok_or_else(|| anyhow!("missing section parent"))?;
+                validate_kind_child(&owner.kind, &section.kind)?;
+            } else {
+                ensure!(
+                    !matches!(section.kind, SectionKind::ListItem { .. }),
+                    "root list item"
+                );
+            }
+            let mut visited = HashSet::new();
+            let mut ancestor = Some(section.id.as_str());
+            while let Some(id) = ancestor {
+                ensure!(visited.insert(id), "section parent cycle");
+                ancestor = known[id].parent.as_deref();
+            }
+        }
+        let mut document = Self::new();
+        {
+            let mut txn = document.doc.transact_mut_with(LOCAL_ORIGIN);
+            let mut ranks: HashMap<Option<&str>, String> = HashMap::new();
+            for section in &sections {
+                let parent = section.parent.as_deref();
+                let rank = fractional_between(ranks.get(&parent).map(String::as_str), None)?;
+                let map =
+                    document
+                        .sections
+                        .insert(&mut txn, section.id.as_str(), MapPrelim::default());
+                map.insert(&mut txn, "kind", encode_kind(&section.kind));
+                map.insert(&mut txn, "position", placement(parent, &rank));
+                let body = map.insert(&mut txn, "body", MapPrelim::default());
+                rich_storage::write_content(&body, &mut txn, &section.content);
+                ranks.insert(parent, rank);
+            }
+        }
+        document.clear_history();
+        Ok(document)
     }
 
     /// Replace one editable body with parsed siblings/subtrees. Paths refer to
@@ -927,7 +1060,7 @@ impl Document {
         let input = if specs.is_empty() {
             vec![BlockSpec {
                 kind: SectionKind::Text,
-                markdown: String::new(),
+                content: RichDocument::paragraph(""),
                 children: vec![],
             }]
         } else {
@@ -997,13 +1130,49 @@ impl Document {
                                 checked.map(|_| false)
                             },
                         },
-                        markdown: String::new(),
+                        content: RichDocument::paragraph(""),
                         children: vec![spec],
                     }
                 } else {
                     spec
                 });
             }
+        }
+        let reuse_path = reuse_path.unwrap();
+        fn collect_ids<'a>(
+            nodes: &'a [markdown_editor::rich::RichNode],
+            ids: &mut HashSet<&'a str>,
+        ) {
+            for node in nodes {
+                ids.insert(node.id.as_str());
+                collect_ids(&node.children, ids);
+            }
+        }
+        fn has_existing_nodes(
+            nodes: &[markdown_editor::rich::RichNode],
+            ids: &HashSet<&str>,
+        ) -> bool {
+            nodes.iter().any(|node| {
+                ids.contains(node.id.as_str()) || has_existing_nodes(&node.children, ids)
+            })
+        }
+        fn has_existing_ids(spec: &BlockSpec, ids: &HashSet<&str>) -> bool {
+            has_existing_nodes(&spec.content.blocks, ids)
+                || spec
+                    .children
+                    .iter()
+                    .any(|child| has_existing_ids(child, ids))
+        }
+        let mut old_ids = HashSet::new();
+        collect_ids(&old.content.blocks, &mut old_ids);
+        // Fresh boundary DTOs have no shared IDs. Native normalization already
+        // carries identities, including nodes moved to another replacement body.
+        if !specs.iter().any(|spec| has_existing_ids(spec, &old_ids)) {
+            let mut retained = &mut specs[reuse_path[0]];
+            for &index in &reuse_path[1..] {
+                retained = &mut retained.children[index];
+            }
+            rich_storage::retain_boundary_ids(&old.content, &mut retained.content);
         }
         let before = next_sibling(&sections, id);
         self.command(|document| {
@@ -1013,7 +1182,7 @@ impl Document {
                 validate_child(&entries, old.parent.as_deref(), &spec.kind)?;
             }
             let mut paths = Vec::new();
-            let mut reuse = Some((id.to_owned(), reuse_path.unwrap()));
+            let mut reuse = Some((id.to_owned(), reuse_path));
             let original_position = find_entry(&entries, id)?.position.as_str();
             let upper = before
                 .as_ref()
@@ -1100,6 +1269,7 @@ impl Document {
     /// Apply an unframed Yjs V1 update. Repeated/out-of-order updates are safe;
     /// Yrs retains unresolved dependencies until their preceding updates arrive.
     pub fn apply_update(&mut self, bytes: &[u8]) -> Result<()> {
+        self.preflight_updates(&[bytes])?;
         let update = decode_exact::<Update>(bytes)?;
         self.doc
             .transact_mut_with(REMOTE_ORIGIN)
@@ -1128,8 +1298,17 @@ impl Document {
     /// Truncated frames and invalid payloads return errors rather than being
     /// silently treated as end-of-stream. Decode everything before mutating.
     pub fn receive_sync(&mut self, message: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let incoming = decode_sync_frames(message)?;
+        let updates: Vec<_> = incoming
+            .iter()
+            .filter_map(|message| match message {
+                Incoming::Update(update) => Some(update.encode_v1()),
+                _ => None,
+            })
+            .collect();
+        self.preflight_updates(&updates.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
         let mut replies = Vec::new();
-        for message in decode_sync_frames(message)? {
+        for message in incoming {
             match message {
                 Incoming::Step1(vector) => {
                     let update = self.doc.transact().encode_state_as_update_v1(&vector);
@@ -1151,6 +1330,14 @@ impl Document {
     /// not applied; pass the original frames to `receive_sync` when ready.
     pub fn reply_sync_without_applying(&self, message: &[u8]) -> Result<Vec<Vec<u8>>> {
         let incoming = decode_sync_frames(message)?;
+        let updates: Vec<_> = incoming
+            .iter()
+            .filter_map(|message| match message {
+                Incoming::Update(update) => Some(update.encode_v1()),
+                _ => None,
+            })
+            .collect();
+        self.preflight_updates(&updates.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
         let txn = self.doc.transact();
         Ok(incoming
             .into_iter()
@@ -1164,6 +1351,37 @@ impl Document {
                 Incoming::Update(_) => None,
             })
             .collect())
+    }
+
+    fn preflight_updates(&self, updates: &[&[u8]]) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let shadow = Doc::with_options(Options {
+            offset_kind: OffsetKind::Utf16,
+            ..Options::default()
+        });
+        shadow
+            .transact_mut()
+            .apply_update(decode_exact::<Update>(&self.encode_state())?)
+            .map_err(|error| anyhow!("cannot copy Yjs state: {error}"))?;
+        for bytes in updates {
+            let isolated = Doc::with_options(Options {
+                offset_kind: OffsetKind::Utf16,
+                ..Options::default()
+            });
+            isolated
+                .transact_mut()
+                .apply_update(decode_exact::<Update>(bytes)?)
+                .map_err(|error| anyhow!("cannot preflight Yjs update: {error}"))?;
+            rich_storage::validate_schema(&isolated, false)?;
+            shadow
+                .transact_mut()
+                .apply_update(decode_exact::<Update>(bytes)?)
+                .map_err(|error| anyhow!("cannot preflight Yjs update: {error}"))?;
+            rich_storage::validate_schema(&shadow, true)?;
+        }
+        Ok(())
     }
 
     fn section_map<T: ReadTxn>(&self, txn: &T, id: &str) -> Result<MapRef> {
@@ -1184,11 +1402,11 @@ impl Document {
                 let Some(Out::Any(Any::String(position))) = section.get(txn, "position") else {
                     return None;
                 };
-                let Some(Out::YText(source)) = section.get(txn, "source") else {
+                let Some(Out::YMap(body)) = section.get(txn, "body") else {
                     return None;
                 };
                 let (parent, rank) = position
-                    .split_once('|')
+                    .rsplit_once('|')
                     .map_or((None, position.as_ref()), |(parent, rank)| {
                         (Some(parent.to_owned()), rank)
                     });
@@ -1198,7 +1416,7 @@ impl Document {
                     parent,
                     kind: read_kind(&section, txn),
                     depth: 0,
-                    source,
+                    body,
                 })
             })
             .collect();
@@ -1322,9 +1540,12 @@ fn validate_child(entries: &[Entry], parent: Option<&str>, kind: &SectionKind) -
 }
 
 fn validate_spec(spec: &BlockSpec) -> Result<()> {
+    spec.content
+        .validate()
+        .map_err(|error| anyhow!("{error}"))?;
     ensure!(
-        spec.kind.is_editable() || spec.markdown.is_empty(),
-        "container source must be empty"
+        spec.kind.is_editable() || spec.content.plain_text().is_empty(),
+        "container text must be empty"
     );
     for child in &spec.children {
         validate_kind_child(&spec.kind, &child.kind)?;
@@ -1392,11 +1613,15 @@ fn next_sibling(sections: &[Section], id: &str) -> Option<SectionId> {
 }
 
 // Kind is one register too: an ordered list's flag and starting number cannot
-// tear under concurrent list-type changes. Absent kind is the old Text schema.
+// tear under concurrent list-type changes.
 fn encode_kind(kind: &SectionKind) -> String {
     match kind {
         SectionKind::Text => "text".to_owned(),
         SectionKind::Quote => "quote".to_owned(),
+        SectionKind::Collapsible { default_collapsed } => format!(
+            "collapsible:{}",
+            if *default_collapsed { "closed" } else { "open" }
+        ),
         SectionKind::List { ordered, start } => format!(
             "list:{}:{start}",
             if *ordered { "ordered" } else { "bullet" }
@@ -1415,6 +1640,12 @@ fn read_kind<T: ReadTxn>(map: &MapRef, txn: &T) -> SectionKind {
     };
     match kind.as_ref() {
         "quote" => SectionKind::Quote,
+        "collapsible:open" => SectionKind::Collapsible {
+            default_collapsed: false,
+        },
+        "collapsible:closed" => SectionKind::Collapsible {
+            default_collapsed: true,
+        },
         "item" => SectionKind::ListItem { checked: None },
         "task:unchecked" => SectionKind::ListItem {
             checked: Some(false),
@@ -1524,7 +1755,7 @@ fn project_tree(mut entries: Vec<Entry>) -> Vec<Entry> {
     visible
 }
 
-fn splice_markdown(
+fn splice_text(
     source: &TextRef,
     txn: &mut yrs::TransactionMut<'_>,
     old: &str,
@@ -1625,12 +1856,21 @@ fn serialize_children(sections: &[Section], parent: Option<&str>) -> String {
                 })
                 .collect::<Vec<_>>()
                 .join("\n"),
+            SectionKind::Collapsible { default_collapsed } => {
+                crate::block_markdown::collapsible_markdown(
+                    &section.content,
+                    &siblings(children, Some(&section.id)),
+                    default_collapsed,
+                    children.get(&Some(section.id.as_str())).map_or(0, Vec::len),
+                )
+            }
             _ => {
                 let nested = siblings(children, Some(&section.id));
+                let body = crate::block::content_markdown(&section.content);
                 if nested.is_empty() {
-                    return section.markdown.clone();
+                    return body;
                 }
-                if section.markdown.is_empty() {
+                if body.is_empty() {
                     return nested;
                 }
                 let list_first = children
@@ -1639,7 +1879,7 @@ fn serialize_children(sections: &[Section], parent: Option<&str>) -> String {
                     .is_some_and(|child| matches!(child.kind, SectionKind::List { .. }));
                 format!(
                     "{}{}{}",
-                    section.markdown,
+                    body,
                     if list_first { "\n" } else { "\n\n" },
                     nested
                 )
@@ -1708,6 +1948,45 @@ fn hex_digit(value: u8) -> char {
 }
 
 #[cfg(test)]
+fn node(document: &Document, section: &str) -> String {
+    document
+        .sections()
+        .into_iter()
+        .find(|entry| entry.id == section)
+        .and_then(|entry| entry.content.blocks.first().map(|node| node.id.clone()))
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn edit_text(document: &mut Document, id: &str, text: &str) -> Result<()> {
+    let mut content = document
+        .sections()
+        .into_iter()
+        .find(|section| section.id == id)
+        .ok_or_else(|| anyhow!("unknown section"))?
+        .content;
+    let block = content
+        .blocks
+        .first_mut()
+        .ok_or_else(|| anyhow!("missing semantic leaf"))?;
+    let marks = block
+        .runs
+        .first()
+        .map(|run| run.marks.clone())
+        .unwrap_or_default();
+    block.runs = if text.is_empty() {
+        vec![]
+    } else {
+        vec![markdown_editor::rich::RichRun {
+            text: text.to_owned(),
+            marks,
+            atom: None,
+        }]
+    };
+    document.set_content(id, &content)
+}
+
+#[cfg(test)]
 #[path = "nested_document_tests.rs"]
 mod nested_tests;
 
@@ -1762,7 +2041,7 @@ mod tests {
         bob.set_markdown(&second, "edited second").unwrap();
         exchange(&mut alice, &mut bob);
         assert_eq!(ids(&alice), [second.clone(), first.clone()]);
-        assert_eq!(alice.sections()[0].markdown, "edited second");
+        assert_eq!(alice.sections()[0].content.plain_text(), "edited second");
         alice.move_section(&first, Some(&second)).unwrap();
         bob.move_section(&first, None).unwrap();
         exchange(&mut alice, &mut bob);

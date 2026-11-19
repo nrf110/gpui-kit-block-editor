@@ -1,7 +1,8 @@
 use gpui_kit::component::{ActiveTheme, StyledExt, button::Button};
 use gpui_kit::*;
 use gpui_kit_block_editor::{
-    BlockEditor, CommandAction, Document, DocumentEvent, ExtensionRegistry, SlashCommand,
+    BlockEditor, CommandAction, Document, DocumentEvent, ExtensionRegistry, RichDocument,
+    SlashCommand,
 };
 
 struct Demo {
@@ -34,14 +35,23 @@ impl Demo {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut document = Document::new();
         for markdown in [
-            "# A place for the next idea\n\nA native, collaborative Markdown canvas. Every line is an independently movable block.",
-            "## Make it yours\n\nType **/** to explore commands. Use **⌘B** for bold and **⌘I** for italic. Hover for the **⠿** drag handle. **Tab** nests a block; **Shift+Tab** lifts it.\n\n- Write in rich text\n- Shape a table or a list\n  - Drag items inside their list group\n- Turn an idea into a diagram",
+            "# A place for the next idea\n\nA native, collaborative rich-text canvas. Markdown is an import/export format, not the document model.",
+            "## Make it yours\n\nType **/** to explore commands, including **/collapsible**. Use **⌘B** for bold and **⌘I** for italic. Hover for the **⠿** drag handle. **Tab** nests a block; **Shift+Tab** lifts it.\n\n- Write in rich text\n- Shape a table or a list\n  - Drag items between lists or pull them up\n- Turn an idea into a diagram",
             "```mermaid\nflowchart LR\n    Idea[An idea] --> Draft[A shared draft]\n    Draft --> Ship[Something great]\n```",
         ] {
             document
                 .insert_section(None, markdown)
                 .expect("valid initial blocks");
         }
+        let details = document
+            .insert_section(None, "Implementation notes")
+            .expect("valid title");
+        let body = document
+            .wrap_collapsible(&details)
+            .expect("valid collapsible section");
+        document.set_content(&body, &RichDocument::paragraph(
+            "This is structured rich text. Expand or collapse it independently in each pane; the content remains collaborative.",
+        )).expect("valid semantic body");
         document.clear_history();
         let mut replica = Document::new();
         replica

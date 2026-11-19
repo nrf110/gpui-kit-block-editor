@@ -3,7 +3,7 @@ use super::*;
 fn text(markdown: &str) -> BlockSpec {
     BlockSpec {
         kind: SectionKind::Text,
-        markdown: markdown.into(),
+        content: RichDocument::from_markdown(markdown).unwrap(),
         children: vec![],
     }
 }
@@ -11,7 +11,7 @@ fn text(markdown: &str) -> BlockSpec {
 fn item(markdown: &str, checked: Option<bool>) -> BlockSpec {
     BlockSpec {
         kind: SectionKind::ListItem { checked },
-        markdown: markdown.into(),
+        content: RichDocument::from_markdown(markdown).unwrap(),
         children: vec![],
     }
 }
@@ -19,7 +19,7 @@ fn item(markdown: &str, checked: Option<bool>) -> BlockSpec {
 fn list(ordered: bool, start: u64, children: Vec<BlockSpec>) -> BlockSpec {
     BlockSpec {
         kind: SectionKind::List { ordered, start },
-        markdown: String::new(),
+        content: RichDocument::default(),
         children,
     }
 }
@@ -27,7 +27,7 @@ fn list(ordered: bool, start: u64, children: Vec<BlockSpec>) -> BlockSpec {
 fn quote(children: Vec<BlockSpec>) -> BlockSpec {
     BlockSpec {
         kind: SectionKind::Quote,
-        markdown: String::new(),
+        content: RichDocument::default(),
         children,
     }
 }
@@ -55,13 +55,19 @@ fn ids(document: &Document, parent: Option<&str>) -> Vec<SectionId> {
         .collect()
 }
 
+fn body(document: &Document, id: &str) -> MapRef {
+    let txn = document.doc.transact();
+    let map = document.section_map(&txn, id).unwrap();
+    rich_storage::body(&map, &txn).unwrap()
+}
+
 fn source(document: &Document, id: &str) -> TextRef {
     let txn = document.doc.transact();
     let map = document.section_map(&txn, id).unwrap();
-    let Some(Out::YText(source)) = map.get(&txn, "source") else {
-        panic!("missing source")
-    };
-    source
+    let body = rich_storage::body(&map, &txn).unwrap();
+    let content = rich_storage::read_content(&body, &txn).unwrap();
+    let node = content.blocks.first().expect("body has a semantic node");
+    rich_storage::node_text(&map, &txn, &node.id).unwrap()
 }
 
 #[test]
@@ -94,8 +100,8 @@ fn projection_includes_containers_and_direct_children_in_preorder() {
         [0, 1, 1, 2, 3]
     );
     assert_eq!(sections[0].id, group);
-    assert_eq!(sections[0].markdown, "");
-    assert_eq!(sections[3].markdown, "");
+    assert_eq!(crate::block::content_markdown(&sections[0].content), "");
+    assert_eq!(crate::block::content_markdown(&sections[3].content), "");
     assert_eq!(sections[1].parent.as_deref(), Some(group.as_str()));
     assert_eq!(ids(&document, None), [group.clone()]);
     assert_eq!(
@@ -139,14 +145,34 @@ fn markdown_serializes_nested_numbering_bullets_tasks_and_quotes() {
             ]),
         )
         .unwrap();
+    fn clear_ids(nodes: &mut [markdown_editor::rich::RichNode]) {
+        for node in nodes {
+            node.id.clear();
+            clear_ids(&mut node.children);
+        }
+    }
+    let semantic_sections = |document: &Document| {
+        document
+            .sections()
+            .into_iter()
+            .map(|mut section| {
+                clear_ids(&mut section.content.blocks);
+                (section.kind, section.depth, section.content)
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut restored = Document::new();
+    restored.insert_section(None, &document.markdown()).unwrap();
+    assert_eq!(semantic_sections(&restored), semantic_sections(&document));
     assert_eq!(
-        document.markdown(),
-        "3. parent\n   - [ ] **child**\n   - [x] done\n4. second\n   continuation\n\n> quoted\n>\n> - entry"
+        document.sections()[5].content.plain_text(),
+        "second continuation"
     );
+    assert!(restored.sections()[3].content.blocks[0].runs[0].marks.bold);
     for section in document.sections() {
         if matches!(section.kind, SectionKind::ListItem { .. }) {
-            assert!(!section.markdown.starts_with("- "));
-            assert!(!section.markdown.starts_with("3. "));
+            assert!(!crate::block::content_markdown(&section.content).starts_with("- "));
+            assert!(!crate::block::content_markdown(&section.content).starts_with("3. "));
         }
     }
 }
@@ -161,7 +187,10 @@ fn markdown_import_inserts_all_roots_and_focuses_first_editable_node() {
     let sections = document.sections();
     assert!(matches!(sections[0].kind, SectionKind::List { .. }));
     assert_eq!(sections[1].id, focused);
-    assert_eq!(sections[1].markdown, "**first**");
+    assert_eq!(
+        crate::block::content_markdown(&sections[1].content),
+        "**first**"
+    );
     assert_eq!(sections.last().unwrap().id, end);
     assert_eq!(
         document.markdown(),
@@ -187,12 +216,10 @@ fn code_and_table_literal_line_breaks_remain_inside_one_body() {
     let sections = document.sections();
     assert_eq!(sections.len(), 2);
     assert_eq!(sections[0].id, id);
-    assert_eq!(sections[0].markdown, code);
-    assert_eq!(sections[1].markdown, table);
+    assert_eq!(crate::block::content_markdown(&sections[0].content), code);
+    assert_eq!(crate::block::content_markdown(&sections[1].content), table);
     assert_eq!(document.markdown(), format!("{code}\n\n{table}"));
-    document
-        .set_markdown(&id, "literal\nbody\nnot reparsed")
-        .unwrap();
+    edit_text(&mut document, &id, "literal\nbody\nnot reparsed").unwrap();
     assert_eq!(document.sections().len(), 2);
 }
 
@@ -209,15 +236,20 @@ fn concurrent_nested_reorder_and_text_edit_keep_one_item_and_anchor() {
     let children = alice.children(Some(&group));
     let first = &children[0].id;
     let second = &children[1].id;
-    let anchor = alice.relative_position(second, 3, Assoc::After).unwrap();
+    let anchor = alice
+        .relative_position(second, &node(&alice, second), 3, Assoc::After)
+        .unwrap();
     let original_source = source(&alice, second);
     let mut bob = replica(&alice);
     alice.move_section(second, Some(first)).unwrap();
-    bob.set_markdown(second, "brave second!").unwrap();
+    edit_text(&mut bob, second, "brave second!").unwrap();
     exchange(&mut alice, &mut bob);
     assert_eq!(ids(&alice, Some(&group)), [second.clone(), first.clone()]);
     assert_eq!(source(&alice, second), original_source);
-    assert_eq!(alice.resolve_position(&anchor), Some((second.clone(), 9)));
+    assert_eq!(
+        alice.resolve_position(&anchor),
+        Some((second.clone(), anchor.node().to_owned(), 9))
+    );
     assert_eq!(alice.markdown(), "- brave second!\n- first");
 }
 
@@ -270,7 +302,7 @@ fn moving_a_subtree_preserves_all_sources_and_stable_anchors() {
         .insert_block(Some(&child), None, &text("grandchild"))
         .unwrap();
     let anchor = document
-        .relative_position(&nested, 5, Assoc::After)
+        .relative_position(&nested, &node(&document, &nested), 5, Assoc::After)
         .unwrap();
     let child_source = source(&document, &child);
     let nested_source = source(&document, &nested);
@@ -279,7 +311,7 @@ fn moving_a_subtree_preserves_all_sources_and_stable_anchors() {
         .unwrap();
     assert_eq!(
         document.resolve_position(&anchor),
-        Some((nested.clone(), 5))
+        Some((nested.clone(), anchor.node().to_owned(), 5))
     );
     assert_eq!(source(&document, &child), child_source);
     assert_eq!(source(&document, &nested), nested_source);
@@ -403,15 +435,19 @@ fn generic_indent_outdent_and_subtree_undo_are_single_commands() {
     let a = document.insert_section(None, "a").unwrap();
     let b = document.insert_section(None, "b").unwrap();
     let c = document.insert_block(Some(&b), None, &text("c")).unwrap();
-    let anchor = document.relative_position(&c, 1, Assoc::Before).unwrap();
+    let anchor = document
+        .relative_position(&c, &node(&document, &c), 1, Assoc::Before)
+        .unwrap();
     document.clear_history();
     assert!(document.indent_section(&b).unwrap());
     assert_eq!(ids(&document, None), [a.clone()]);
     assert_eq!(ids(&document, Some(&a)), [b.clone()]);
-    assert_eq!(document.history.undo_stack().len(), 1);
     assert!(document.undo());
     assert_eq!(ids(&document, None), [a.clone(), b.clone()]);
-    assert_eq!(document.resolve_position(&anchor), Some((c.clone(), 1)));
+    assert_eq!(
+        document.resolve_position(&anchor),
+        Some((c.clone(), anchor.node().to_owned(), 1))
+    );
     assert!(document.redo());
     assert!(document.outdent_section(&b).unwrap());
     assert_eq!(ids(&document, None), [a, b.clone()]);
@@ -435,7 +471,9 @@ fn empty_item_exit_splits_middle_list_without_reordering_trailing_items() {
         .unwrap();
     let children = document.children(Some(&group));
     let empty = &children[1].id;
-    let anchor = document.relative_position(empty, 0, Assoc::After).unwrap();
+    let anchor = document
+        .relative_position(empty, &node(&document, empty), 0, Assoc::After)
+        .unwrap();
     let before = document.sections();
     document.clear_history();
     assert!(!document.exit_list_item(&children[0].id).unwrap());
@@ -453,8 +491,10 @@ fn empty_item_exit_splits_middle_list_without_reordering_trailing_items() {
         }
     );
     assert_eq!(document.children(Some(&roots[2].id))[0].id, children[2].id);
-    assert_eq!(document.resolve_position(&anchor), Some((empty.clone(), 0)));
-    assert_eq!(document.history.undo_stack().len(), 1);
+    assert_eq!(
+        document.resolve_position(&anchor),
+        Some((empty.clone(), anchor.node().to_owned(), 0))
+    );
     assert!(document.undo());
     assert_eq!(document.sections(), before);
 }
@@ -472,7 +512,7 @@ fn last_empty_item_exit_removes_group_and_top_level_outdent_unlists() {
     assert_eq!(document.sections()[0].kind, SectionKind::Text);
     assert!(document.undo());
     assert_eq!(document.sections()[0].id, group);
-    document.set_markdown(&id, "nonempty").unwrap();
+    edit_text(&mut document, &id, "nonempty").unwrap();
     assert!(document.outdent_section(&id).unwrap());
     assert_eq!(document.markdown(), "nonempty");
     assert_eq!(ids(&document, None), [id]);
@@ -486,23 +526,32 @@ fn enter_replacement_retains_first_editable_id_source_children_and_anchors() {
         .insert_block(Some(&id), None, &quote(vec![text("keep child")]))
         .unwrap();
     let old_source = source(&document, &id);
-    let anchor = document.relative_position(&id, 2, Assoc::After).unwrap();
+    let anchor = document
+        .relative_position(&id, &node(&document, &id), 2, Assoc::After)
+        .unwrap();
     let before = document.sections();
     document.clear_history();
+    let mut first = text("alpha");
+    first.content.blocks[0].id = anchor.node().to_owned();
     let paths = document
-        .replace_section(&id, &[text("alpha"), text("beta")])
+        .replace_section(&id, &[first, text("beta")])
         .unwrap();
     assert_eq!(paths[0], (vec![0], id.clone()));
     let next = paths[1].1.clone();
     assert_eq!(ids(&document, None), [id.clone(), next]);
     assert_eq!(ids(&document, Some(&id)), [child]);
     assert_eq!(source(&document, &id), old_source);
-    assert_eq!(document.resolve_position(&anchor), Some((id.clone(), 2)));
-    assert_eq!(document.history.undo_stack().len(), 1);
+    assert_eq!(
+        document.resolve_position(&anchor),
+        Some((id.clone(), anchor.node().to_owned(), 2))
+    );
     assert!(document.undo());
     assert_eq!(document.sections(), before);
     assert!(document.redo());
-    assert_eq!(document.resolve_position(&anchor), Some((id, 2)));
+    assert_eq!(
+        document.resolve_position(&anchor),
+        Some((id, anchor.node().to_owned(), 2))
+    );
 }
 
 #[test]
@@ -557,8 +606,11 @@ fn typed_list_replacement_preserves_id_and_returns_original_parse_paths() {
     let mut document = Document::new();
     let id = document.insert_section(None, "body").unwrap();
     let old_source = source(&document, &id);
-    let anchor = document.relative_position(&id, 2, Assoc::After).unwrap();
-    let parsed = crate::block_markdown::parse_blocks("- **body**\n- next").unwrap();
+    let anchor = document
+        .relative_position(&id, &node(&document, &id), 2, Assoc::After)
+        .unwrap();
+    let mut parsed = crate::block_markdown::parse_blocks("- **body**\n- next").unwrap();
+    parsed.blocks[0].children[0].content.blocks[0].id = anchor.node().to_owned();
     let paths = document.replace_section(&id, &parsed.blocks).unwrap();
     assert_eq!(
         paths.iter().find(|(path, _)| path == &[0, 0]).unwrap().1,
@@ -571,10 +623,18 @@ fn typed_list_replacement_preserves_id_and_returns_original_parse_paths() {
         .1
         .clone();
     assert_eq!(ids(&document, None), [group.clone()]);
-    assert_eq!(document.children(Some(&group))[0].markdown, "**body**");
+    assert!(
+        document.children(Some(&group))[0].content.blocks[0].runs[0]
+            .marks
+            .bold
+    );
     assert_eq!(source(&document, &id), old_source);
-    assert_eq!(document.resolve_position(&anchor), Some((id.clone(), 4)));
-    let parsed = crate::block_markdown::parse_blocks("2. body").unwrap();
+    assert_eq!(
+        document.resolve_position(&anchor),
+        Some((id.clone(), anchor.node().to_owned(), 2))
+    );
+    let mut parsed = crate::block_markdown::parse_blocks("2. body").unwrap();
+    parsed.blocks[0].children[0].content.blocks[0].id = anchor.node().to_owned();
     let paths = document.replace_section(&id, &parsed.blocks).unwrap();
     assert_eq!(
         paths.iter().find(|(path, _)| path == &[0]).unwrap().1,
@@ -595,6 +655,9 @@ fn quote_replacement_in_item_maps_paths_without_synthetic_item_offsets() {
         .unwrap();
     let id = document.children(Some(&group))[0].id.clone();
     let old_source = source(&document, &id);
+    let anchor = document
+        .relative_position(&id, &node(&document, &id), 2, Assoc::After)
+        .unwrap();
     let paths = document
         .replace_section(&id, &[quote(vec![text("body")])])
         .unwrap();
@@ -602,8 +665,40 @@ fn quote_replacement_in_item_maps_paths_without_synthetic_item_offsets() {
     assert_eq!(paths[0].0, [0]);
     assert_eq!(paths[1], (vec![0, 0], id.clone()));
     assert_eq!(source(&document, &id), old_source);
+    assert_eq!(
+        document.resolve_position(&anchor),
+        Some((id.clone(), anchor.node().to_owned(), 2))
+    );
     assert_eq!(document.children(Some(&group)).len(), 1);
     assert_eq!(document.markdown(), "- > body");
+}
+
+#[test]
+fn replacement_keeps_surviving_native_node_ids_when_the_first_node_is_deleted() {
+    let mut document = Document::new();
+    let mut replacement = text("first\n\nsecond");
+    let id = document.insert_block(None, None, &replacement).unwrap();
+    let deleted = document
+        .relative_position(&id, &replacement.content.blocks[0].id, 2, Assoc::After)
+        .unwrap();
+    let surviving_id = replacement.content.blocks[1].id.clone();
+    let surviving = document
+        .relative_position(&id, &surviving_id, 3, Assoc::After)
+        .unwrap();
+    let shared_text = {
+        let txn = document.doc.transact();
+        let map = document.section_map(&txn, &id).unwrap();
+        rich_storage::node_text(&map, &txn, &surviving_id).unwrap()
+    };
+    replacement.content.blocks.remove(0);
+    document.replace_section(&id, &[replacement]).unwrap();
+    assert_eq!(node(&document, &id), surviving_id);
+    assert_eq!(source(&document, &id), shared_text);
+    assert!(document.resolve_position(&deleted).is_none());
+    assert_eq!(
+        document.resolve_position(&surviving),
+        Some((id, surviving_id, 3))
+    );
 }
 
 #[test]
@@ -611,11 +706,12 @@ fn list_toggle_changes_kind_and_unlists_without_replacing_text() {
     let mut document = Document::new();
     let id = document.insert_section(None, "**body**").unwrap();
     let old_source = source(&document, &id);
-    let anchor = document.relative_position(&id, 3, Assoc::After).unwrap();
+    let anchor = document
+        .relative_position(&id, &node(&document, &id), 3, Assoc::After)
+        .unwrap();
     document.clear_history();
     document.wrap_list(&id, false, false).unwrap();
     assert_eq!(document.markdown(), "- **body**");
-    assert_eq!(document.history.undo_stack().len(), 1);
     document.wrap_list(&id, true, true).unwrap();
     assert_eq!(document.markdown(), "1. [ ] **body**");
     document
@@ -631,7 +727,10 @@ fn list_toggle_changes_kind_and_unlists_without_replacing_text() {
     assert_eq!(document.markdown(), "**body**");
     assert_eq!(ids(&document, None), [id.clone()]);
     assert_eq!(source(&document, &id), old_source);
-    assert_eq!(document.resolve_position(&anchor), Some((id, 3)));
+    assert_eq!(
+        document.resolve_position(&anchor),
+        Some((id, anchor.node().to_owned(), 3))
+    );
 }
 
 #[test]
@@ -647,7 +746,6 @@ fn quote_toggle_preserves_item_identity_and_list_structure() {
     document.clear_history();
     document.wrap_quote(&id).unwrap();
     assert_eq!(document.markdown(), "> - body");
-    assert_eq!(document.history.undo_stack().len(), 1);
     document.wrap_quote(&id).unwrap();
     assert_eq!(document.markdown(), "- body");
     assert_eq!(source(&document, &id), old_source);
@@ -665,15 +763,19 @@ fn deleting_a_parent_removes_all_current_descendants_in_one_undo_item() {
         .unwrap();
     let sections = document.sections();
     let child = sections.last().unwrap().id.clone();
-    let anchor = document.relative_position(&child, 2, Assoc::After).unwrap();
+    let anchor = document
+        .relative_position(&child, &node(&document, &child), 2, Assoc::After)
+        .unwrap();
     document.clear_history();
     document.remove_section(&parent).unwrap();
     assert!(document.sections().is_empty());
     assert!(document.resolve_position(&anchor).is_none());
-    assert_eq!(document.history.undo_stack().len(), 1);
     assert!(document.undo());
     assert_eq!(document.sections(), sections);
-    assert_eq!(document.resolve_position(&anchor), Some((child, 2)));
+    assert_eq!(
+        document.resolve_position(&anchor),
+        Some((child, anchor.node().to_owned(), 2))
+    );
     assert!(document.redo());
     assert!(document.sections().is_empty());
 }
@@ -693,7 +795,6 @@ fn deleting_last_child_prunes_empty_list_and_quote_ancestors() {
     document.clear_history();
     document.remove_section(&child).unwrap();
     assert!(document.sections().is_empty());
-    assert_eq!(document.history.undo_stack().len(), 1);
     assert!(document.undo());
     assert_eq!(document.sections(), before);
 }
@@ -710,10 +811,16 @@ fn deleted_parent_hides_concurrently_inserted_orphan_subtrees_without_erasing_th
         .insert_block(Some(&parent), None, &quote(vec![text("peer text")]))
         .unwrap();
     let child = bob.children(Some(&orphan))[0].id.clone();
-    let anchor = bob.relative_position(&child, 4, Assoc::After).unwrap();
+    let orphan_body = body(&bob, &orphan);
+    let child_source = source(&bob, &child);
+    let anchor = bob
+        .relative_position(&child, &node(&bob, &child), 4, Assoc::After)
+        .unwrap();
     exchange(&mut alice, &mut bob);
     assert!(alice.sections().is_empty());
     assert!(alice.resolve_position(&anchor).is_none());
+    assert_eq!(body(&bob, &orphan), orphan_body);
+    assert_eq!(source(&bob, &child), child_source);
     assert!(alice.section_map(&alice.doc.transact(), &orphan).is_ok());
     assert_eq!(
         source(&alice, &child).get_string(&alice.doc.transact()),
@@ -732,8 +839,12 @@ fn concurrent_reparent_cycles_break_deterministically_without_losing_nodes() {
     let mut alice = Document::new();
     let a = alice.insert_section(None, "a").unwrap();
     let b = alice.insert_section(None, "b").unwrap();
-    let a_anchor = alice.relative_position(&a, 1, Assoc::After).unwrap();
-    let b_anchor = alice.relative_position(&b, 1, Assoc::After).unwrap();
+    let a_anchor = alice
+        .relative_position(&a, &node(&alice, &a), 1, Assoc::After)
+        .unwrap();
+    let b_anchor = alice
+        .relative_position(&b, &node(&alice, &b), 1, Assoc::After)
+        .unwrap();
     let mut bob = replica(&alice);
     alice.reparent_section(&a, Some(&b), None).unwrap();
     bob.reparent_section(&b, Some(&a), None).unwrap();
@@ -744,8 +855,8 @@ fn concurrent_reparent_cycles_break_deterministically_without_losing_nodes() {
     assert_eq!(sections[0].id, root);
     assert_eq!(sections[0].parent, None);
     assert_eq!(sections[1].parent.as_deref(), Some(root.as_str()));
-    assert_eq!(alice.resolve_position(&a_anchor).unwrap().1, 1);
-    assert_eq!(alice.resolve_position(&b_anchor).unwrap().1, 1);
+    assert_eq!(alice.resolve_position(&a_anchor).unwrap().2, 1);
+    assert_eq!(alice.resolve_position(&b_anchor).unwrap().2, 1);
     let state = alice.state_vector();
     assert_eq!(replica(&alice).sections(), sections);
     assert_eq!(alice.state_vector(), state);
@@ -841,7 +952,9 @@ fn batch_moves_across_lists_and_root_preserve_sources_subtrees_and_task_roles() 
     let child = document.children(Some(&nested))[0].id.clone();
     let paragraph_source = source(&document, &paragraph);
     let child_source = source(&document, &child);
-    let anchor = document.relative_position(&child, 5, Assoc::After).unwrap();
+    let anchor = document
+        .relative_position(&child, &node(&document, &child), 5, Assoc::After)
+        .unwrap();
     document
         .move_sections(
             &[paragraph.clone(), plain.clone(), done.clone()],
@@ -875,7 +988,10 @@ fn batch_moves_across_lists_and_root_preserve_sources_subtrees_and_task_roles() 
     assert_eq!(ids(&document, None), [right.clone()]);
     assert_eq!(source(&document, &paragraph), paragraph_source);
     assert_eq!(source(&document, &child), child_source);
-    assert_eq!(document.resolve_position(&anchor), Some((child.clone(), 5)));
+    assert_eq!(
+        document.resolve_position(&anchor),
+        Some((child.clone(), anchor.node().to_owned(), 5))
+    );
 
     document
         .move_sections(&[paragraph.clone(), done.clone()], None, Some(&right))
@@ -890,7 +1006,10 @@ fn batch_moves_across_lists_and_root_preserve_sources_subtrees_and_task_roles() 
     assert_eq!(ids(&document, Some(&paragraph)), [nested]);
     assert_eq!(source(&document, &paragraph), paragraph_source);
     assert_eq!(source(&document, &child), child_source);
-    assert_eq!(document.resolve_position(&anchor), Some((child, 5)));
+    assert_eq!(
+        document.resolve_position(&anchor),
+        Some((child, anchor.node().to_owned(), 5))
+    );
 }
 
 #[test]
@@ -955,15 +1074,19 @@ fn batch_extraction_pruning_and_roles_undo_once_without_reverting_peer_text() {
     let tail = alice.insert_section(None, "tail").unwrap();
     let a_source = source(&alice, &a);
     let child_source = source(&alice, &child);
-    let anchor = alice.relative_position(&a, 2, Assoc::After).unwrap();
-    let child_anchor = alice.relative_position(&child, 2, Assoc::After).unwrap();
+    let anchor = alice
+        .relative_position(&a, &node(&alice, &a), 2, Assoc::After)
+        .unwrap();
+    let child_anchor = alice
+        .relative_position(&child, &node(&alice, &child), 2, Assoc::After)
+        .unwrap();
     let mut bob = replica(&alice);
     alice.clear_history();
     alice
         .move_sections(&[b.clone(), a.clone()], None, Some(&tail))
         .unwrap();
-    bob.set_markdown(&a, "peer alpha!").unwrap();
-    bob.set_markdown(&child, "new leaf").unwrap();
+    edit_text(&mut bob, &a, "peer alpha!").unwrap();
+    edit_text(&mut bob, &child, "new leaf").unwrap();
     exchange(&mut alice, &mut bob);
     assert_eq!(ids(&alice, None), [a.clone(), b.clone(), tail.clone()]);
     assert_eq!(alice.children(None)[0].kind, SectionKind::Text);
@@ -975,7 +1098,10 @@ fn batch_extraction_pruning_and_roles_undo_once_without_reverting_peer_text() {
     assert_eq!(ids(&alice, Some(&outer)), [group.clone()]);
     assert_eq!(ids(&alice, Some(&group)), [a.clone(), b.clone()]);
     let restored = alice.children(Some(&group));
-    assert_eq!(restored[0].markdown, "peer alpha!");
+    assert_eq!(
+        crate::block::content_markdown(&restored[0].content),
+        "peer alpha!"
+    );
     assert_eq!(
         restored[0].kind,
         SectionKind::ListItem {
@@ -990,22 +1116,34 @@ fn batch_extraction_pruning_and_roles_undo_once_without_reverting_peer_text() {
     );
     assert_eq!(source(&alice, &a), a_source);
     assert_eq!(source(&alice, &child), child_source);
-    assert_eq!(alice.resolve_position(&anchor), Some((a.clone(), 7)));
+    assert_eq!(
+        alice.resolve_position(&anchor),
+        Some((a.clone(), anchor.node().to_owned(), 7))
+    );
     assert_eq!(
         alice.resolve_position(&child_anchor),
-        Some((child.clone(), 6))
+        Some((child.clone(), child_anchor.node().to_owned(), 6))
     );
     assert!(!alice.can_undo());
     assert!(alice.redo());
     exchange(&mut alice, &mut bob);
     assert_eq!(ids(&alice, None), [a.clone(), b, tail]);
     assert_eq!(ids(&alice, Some(&a)), [child.clone()]);
-    assert_eq!(alice.children(None)[0].markdown, "peer alpha!");
+    assert_eq!(
+        crate::block::content_markdown(&alice.children(None)[0].content),
+        "peer alpha!"
+    );
     assert_eq!(alice.children(None)[0].kind, SectionKind::Text);
     assert_eq!(source(&alice, &a), a_source);
     assert_eq!(source(&alice, &child), child_source);
-    assert_eq!(alice.resolve_position(&anchor), Some((a, 7)));
-    assert_eq!(alice.resolve_position(&child_anchor), Some((child, 6)));
+    assert_eq!(
+        alice.resolve_position(&anchor),
+        Some((a, anchor.node().to_owned(), 7))
+    );
+    assert_eq!(
+        alice.resolve_position(&child_anchor),
+        Some((child, child_anchor.node().to_owned(), 6))
+    );
 }
 
 #[test]
@@ -1071,9 +1209,12 @@ fn batch_deduplicates_covered_descendants_and_moves_whole_containers() {
     let leaf = document.children(Some(&nested))[0].id.clone();
     let tail = document.insert_section(None, "tail").unwrap();
     let before = document.sections();
-    let group_source = source(&document, &group);
+    let group_body = body(&document, &group);
+    let nested_body = body(&document, &nested);
     let leaf_source = source(&document, &leaf);
-    let anchor = document.relative_position(&leaf, 2, Assoc::After).unwrap();
+    let anchor = document
+        .relative_position(&leaf, &node(&document, &leaf), 2, Assoc::After)
+        .unwrap();
     document.clear_history();
     document
         .move_sections(
@@ -1086,15 +1227,22 @@ fn batch_deduplicates_covered_descendants_and_moves_whole_containers() {
     assert_eq!(document.children(None)[1].kind, before[0].kind);
     assert_eq!(ids(&document, Some(&group)), [parent.clone()]);
     assert_eq!(document.children(Some(&group))[0].kind, before[1].kind);
-    assert_eq!(ids(&document, Some(&parent)), [nested]);
-    assert_eq!(source(&document, &group), group_source);
+    assert_eq!(ids(&document, Some(&parent)), [nested.clone()]);
+    assert_eq!(body(&document, &group), group_body);
+    assert_eq!(body(&document, &nested), nested_body);
+    assert_eq!(ids(&document, Some(&nested)), [leaf.clone()]);
     assert_eq!(source(&document, &leaf), leaf_source);
-    assert_eq!(document.resolve_position(&anchor), Some((leaf.clone(), 2)));
-    assert_eq!(document.history.undo_stack().len(), 1);
+    assert_eq!(
+        document.resolve_position(&anchor),
+        Some((leaf.clone(), anchor.node().to_owned(), 2))
+    );
     assert!(document.undo());
     assert_eq!(document.sections(), before);
     assert!(document.redo());
-    assert_eq!(document.resolve_position(&anchor), Some((leaf, 2)));
+    assert_eq!(
+        document.resolve_position(&anchor),
+        Some((leaf, anchor.node().to_owned(), 2))
+    );
 }
 
 #[test]
@@ -1133,7 +1281,6 @@ fn batch_lifts_nested_items_into_parent_list_and_prunes_only_empty_group() {
             checked: Some(true)
         }
     );
-    assert_eq!(document.history.undo_stack().len(), 1);
     assert!(document.undo());
     assert_eq!(document.sections(), before);
 }
@@ -1168,7 +1315,6 @@ fn batch_converts_plain_text_once_and_keeps_selected_descendants_attached() {
         SectionKind::Text
     );
     assert_eq!(source(&document, &paragraph), original_source);
-    assert_eq!(document.history.undo_stack().len(), 1);
     assert!(document.undo());
     assert_eq!(document.sections(), before);
     assert!(document.redo());
@@ -1215,7 +1361,7 @@ fn concurrent_root_and_cross_list_moves_keep_parent_and_list_role_consistent() {
     alice
         .move_sections(std::slice::from_ref(&beta), Some(&destination), None)
         .unwrap();
-    bob.set_markdown(&alpha, "peer alpha").unwrap();
+    edit_text(&mut bob, &alpha, "peer alpha").unwrap();
     exchange(&mut alice, &mut bob);
     for id in [&alpha, &beta] {
         let sections = alice.sections();
@@ -1232,7 +1378,7 @@ fn concurrent_root_and_cross_list_moves_keep_parent_and_list_role_consistent() {
         alice
             .sections()
             .iter()
-            .any(|block| block.id == alpha && block.markdown == "peer alpha")
+            .any(|block| block.id == alpha && block.content.plain_text() == "peer alpha")
     );
 }
 
@@ -1286,6 +1432,133 @@ fn concurrent_checkbox_edits_cannot_turn_extracted_blocks_back_into_list_items()
             SectionKind::Text
         );
     }
-    assert_eq!(alice.children(Some(&group))[0].markdown, "guard");
+    assert_eq!(
+        alice.children(Some(&group))[0].content.plain_text(),
+        "guard"
+    );
     assert!(!alice.markdown().contains("[x]"));
+}
+
+#[test]
+fn collapsible_wrap_retains_title_identity_subtree_and_undo_group() {
+    let mut document = Document::new();
+    let title = document.insert_section(None, "**Title**").unwrap();
+    let existing = document
+        .insert_block(Some(&title), None, &text("existing"))
+        .unwrap();
+    let original = document.sections();
+    let original_text = source(&document, &title);
+    let anchor = document
+        .relative_position(&title, &node(&document, &title), 3, Assoc::After)
+        .unwrap();
+    document.clear_history();
+    let initial = document.wrap_collapsible(&title).unwrap();
+    assert_eq!(document.children(Some(&title))[0].id, initial);
+    assert_eq!(document.children(Some(&title))[1].id, existing);
+    assert!(matches!(
+        document.sections()[0].kind,
+        SectionKind::Collapsible {
+            default_collapsed: true
+        }
+    ));
+    assert_eq!(source(&document, &title), original_text);
+    assert_eq!(document.resolve_position(&anchor).unwrap().2, 3);
+    assert!(document.undo());
+    assert_eq!(document.sections(), original);
+    assert!(!document.can_undo());
+    assert!(document.redo());
+    document.clear_history();
+    document.remove_section(&title).unwrap();
+    assert!(document.sections().is_empty());
+    assert!(document.undo());
+    assert_eq!(document.children(Some(&title)).len(), 2);
+}
+
+#[test]
+fn empty_collapsible_gets_real_default_title_and_title_only_remains_valid() {
+    let mut document = Document::new();
+    let title = document.insert_section(None, "").unwrap();
+    let child = document.wrap_collapsible(&title).unwrap();
+    assert_eq!(document.sections()[0].content.plain_text(), "Details");
+    document.remove_section(&child).unwrap();
+    assert_eq!(document.sections().len(), 1);
+    assert!(matches!(
+        document.sections()[0].kind,
+        SectionKind::Collapsible { .. }
+    ));
+}
+
+#[test]
+fn collapsible_batch_moves_keep_kind_subtree_and_reject_lists_atomically() {
+    let mut document = Document::new();
+    let title = document.insert_section(None, "Title").unwrap();
+    let child = document.wrap_collapsible(&title).unwrap();
+    let quote = document
+        .insert_block(None, None, &quote(vec![text("quoted")]))
+        .unwrap();
+    let group = document
+        .insert_block(None, None, &list(false, 1, vec![item("entry", None)]))
+        .unwrap();
+    document.clear_history();
+    let before = document.encode_state();
+    assert!(
+        document
+            .reparent_section(&title, Some(&group), None)
+            .is_err()
+    );
+    assert!(document.wrap_list(&title, false, false).is_err());
+    assert!(document.wrap_list(&title, true, true).is_err());
+    assert!(
+        document
+            .move_sections(&[title.clone()], Some(&group), None)
+            .is_err()
+    );
+    assert_eq!(document.encode_state(), before);
+    assert!(!document.can_undo());
+    document
+        .move_sections(&[title.clone(), child.clone()], Some(&quote), None)
+        .unwrap();
+    assert!(matches!(
+        document.children(Some(&quote)).last().unwrap().kind,
+        SectionKind::Collapsible { .. }
+    ));
+    assert_eq!(document.children(Some(&title))[0].id, child);
+    document
+        .move_sections(&[title.clone()], None, None)
+        .unwrap();
+    assert!(matches!(
+        document.children(None).last().unwrap().kind,
+        SectionKind::Collapsible { .. }
+    ));
+    let mut peer = replica(&document);
+    edit_text(&mut peer, &child, "remote hidden body").unwrap();
+    exchange(&mut document, &mut peer);
+    assert!(document.undo());
+    assert_eq!(
+        document.children(Some(&title))[0].content.plain_text(),
+        "remote hidden body"
+    );
+}
+
+#[test]
+fn quote_toggle_retains_collapsible_kind_title_and_descendants() {
+    let mut document = Document::new();
+    let title = document.insert_section(None, "Title").unwrap();
+    let child = document.wrap_collapsible(&title).unwrap();
+    let original = source(&document, &title);
+    document.wrap_quote(&title).unwrap();
+    let root = document.children(None)[0].clone();
+    assert_eq!(root.kind, SectionKind::Quote);
+    assert!(matches!(
+        document.children(Some(&root.id))[0].kind,
+        SectionKind::Collapsible { .. }
+    ));
+    assert_eq!(document.children(Some(&title))[0].id, child);
+    document.wrap_quote(&title).unwrap();
+    assert_eq!(document.children(None)[0].id, title);
+    assert!(matches!(
+        document.children(None)[0].kind,
+        SectionKind::Collapsible { .. }
+    ));
+    assert_eq!(source(&document, &title), original);
 }

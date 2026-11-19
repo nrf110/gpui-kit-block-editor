@@ -22,7 +22,15 @@ pub(super) fn setup(
     let mut document = Document::new();
     let id = document.insert_section(None, source).unwrap();
     document.clear_history();
-    let (window, editor) = cx.update(|cx| {
+    let (window, editor) = mount(document, cx);
+    (window, editor, id)
+}
+
+pub(super) fn mount(
+    document: Document,
+    cx: &mut TestAppContext,
+) -> (AnyWindowHandle, Entity<BlockEditor>) {
+    cx.update(|cx| {
         gpui_kit::open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds {
@@ -37,8 +45,25 @@ pub(super) fn setup(
             },
         )
         .unwrap()
-    });
-    (window, editor, id)
+    })
+}
+
+pub(super) fn set_text(document: &mut Document, id: &str, text: &str) {
+    let mut content = document
+        .sections()
+        .into_iter()
+        .find(|section| section.id == id)
+        .unwrap()
+        .content;
+    content.blocks[0].runs = if text.is_empty() {
+        Vec::new()
+    } else {
+        vec![crate::RichRun {
+            text: text.to_owned(),
+            ..Default::default()
+        }]
+    };
+    document.set_content(id, &content).unwrap();
 }
 
 pub(super) fn select(
@@ -85,7 +110,21 @@ fn remote_structure_and_marks_keep_the_caret_in_the_same_content(cx: &mut TestAp
     .unwrap();
     let vector = remote.state_vector();
     remote.insert_section(Some(&id), "Inserted").unwrap();
-    remote.set_markdown(&id, "same **bold** 👋!").unwrap();
+    let mut content = remote
+        .sections()
+        .into_iter()
+        .find(|section| section.id == id)
+        .unwrap()
+        .content;
+    content.blocks[0]
+        .runs
+        .iter_mut()
+        .find(|run| run.marks.bold)
+        .unwrap()
+        .marks
+        .italic = true;
+    content.blocks[0].runs.last_mut().unwrap().text.push('!');
+    remote.set_content(&id, &content).unwrap();
     let update = remote.encode_update(&vector).unwrap();
     cx.update_window(handle, |_, window, cx| {
         editor.update(cx, |editor, cx| {
@@ -127,7 +166,7 @@ fn framed_sync_preserves_a_reversed_unicode_selection(cx: &mut TestAppContext) {
         select(&editor, &id, 0, 12, 9, window, cx)
     })
     .unwrap();
-    remote.set_markdown(&id, "peer one 👋 two").unwrap();
+    set_text(&mut remote, &id, "peer one 👋 two");
     let message = Message::Sync(SyncMessage::Update(remote.encode_state())).encode_v1();
     cx.update_window(handle, |_, window, cx| {
         editor.update(cx, |editor, cx| {
@@ -166,7 +205,7 @@ fn keyboard_undo_and_redo_keep_peer_changes_and_emit_sync_updates(cx: &mut TestA
     })
     .unwrap();
     let vector = remote.state_vector();
-    remote.set_markdown(&id, "start peer").unwrap();
+    set_text(&mut remote, &id, "start peer");
     let update = remote.encode_update(&vector).unwrap();
     cx.update_window(handle, |_, window, cx| {
         editor.update(cx, |editor, cx| {
@@ -182,7 +221,7 @@ fn keyboard_undo_and_redo_keep_peer_changes_and_emit_sync_updates(cx: &mut TestA
         assert!(editor.error.is_none(), "{:?}", editor.error);
     });
     let vector = remote.state_vector();
-    remote.set_markdown(&id, "start peer!").unwrap();
+    set_text(&mut remote, &id, "start peer!");
     let update = remote.encode_update(&vector).unwrap();
     cx.update_window(handle, |_, window, cx| {
         editor.update(cx, |editor, cx| {
@@ -262,7 +301,7 @@ fn remote_updates_wait_for_ime_commit_without_losing_composed_text(cx: &mut Test
     })
     .unwrap();
     let vector = remote.state_vector();
-    remote.set_markdown(&id, "peer start").unwrap();
+    set_text(&mut remote, &id, "peer start");
     let update = remote.encode_update(&vector).unwrap();
     let message = Message::Sync(SyncMessage::Update(remote.encode_state())).encode_v1();
     cx.update_window(handle, |_, window, cx| {
@@ -270,7 +309,16 @@ fn remote_updates_wait_for_ime_commit_without_losing_composed_text(cx: &mut Test
             editor.apply_update(&update, window, cx).unwrap();
             editor.receive_sync(&message, window, cx).unwrap();
             assert!(editor.views[&id].editor.read(cx).is_composing());
-            assert_eq!(editor.views[&id].editor.read(cx).source(), "startに");
+            assert_eq!(
+                editor.views[&id]
+                    .editor
+                    .read(cx)
+                    .model()
+                    .rich_document()
+                    .unwrap()
+                    .plain_text(),
+                "startに"
+            );
             editor.views[&id]
                 .editor
                 .update(cx, |state, cx| state.unmark_text(window, cx));
@@ -283,7 +331,16 @@ fn remote_updates_wait_for_ime_commit_without_losing_composed_text(cx: &mut Test
     editor.read_with(cx, |editor, cx| {
         assert!(editor.pending_remote.is_empty());
         assert_eq!(editor.markdown(), "peer startに");
-        assert_eq!(editor.views[&id].editor.read(cx).source(), "peer startに");
+        assert_eq!(
+            editor.views[&id]
+                .editor
+                .read(cx)
+                .model()
+                .rich_document()
+                .unwrap()
+                .plain_text(),
+            "peer startに"
+        );
         assert!(editor.error.is_none(), "{:?}", editor.error);
     });
 }

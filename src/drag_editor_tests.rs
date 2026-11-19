@@ -1,4 +1,4 @@
-use super::collaboration_tests::{replica, select, setup};
+use super::collaboration_tests::{replica, select, set_text, setup};
 use super::{BlockEditor, SectionKind};
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{
@@ -48,11 +48,11 @@ fn dragging_a_task_out_of_its_list_keeps_children_caret_and_undo(cx: &mut TestAp
         let sections = editor.document.sections();
         let two = sections
             .iter()
-            .find(|block| block.markdown == "two")
+            .find(|block| block.content.plain_text() == "two")
             .unwrap();
         let child = sections
             .iter()
-            .find(|block| block.markdown == "child")
+            .find(|block| block.content.plain_text() == "child")
             .unwrap();
         (
             two.id.clone(),
@@ -122,15 +122,15 @@ fn nested_list_boundary_pulls_an_item_up_with_its_subtree(cx: &mut TestAppContex
         let sections = editor.document.sections();
         let nested = sections
             .iter()
-            .find(|block| block.markdown == "nested")
+            .find(|block| block.content.plain_text() == "nested")
             .unwrap();
         let child = sections
             .iter()
-            .find(|block| block.markdown == "child")
+            .find(|block| block.content.plain_text() == "child")
             .unwrap();
         let tail = sections
             .iter()
-            .find(|block| block.markdown == "tail")
+            .find(|block| block.content.plain_text() == "tail")
             .unwrap();
         (
             nested.id.clone(),
@@ -182,7 +182,7 @@ fn range_and_toggle_selection_drag_in_document_order_and_undo_once(cx: &mut Test
     });
     let mut peer = replica(&editor, cx);
     let vector = peer.state_vector();
-    peer.set_markdown(&b, "peer B").unwrap();
+    set_text(&mut peer, &b, "peer B");
     let update = peer.encode_update(&vector).unwrap();
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
@@ -246,7 +246,7 @@ fn range_and_toggle_selection_drag_in_document_order_and_undo_once(cx: &mut Test
             "{:?}",
             editor.order
         );
-        assert_eq!(editor.views[&b].source, "peer B");
+        assert_eq!(editor.views[&b].content.plain_text(), "peer B");
         assert!(editor.error.is_none(), "{:?}", editor.error);
     });
     cx.update_window(handle, |_, window, cx| window.press("cmd-z", cx))
@@ -259,7 +259,7 @@ fn range_and_toggle_selection_drag_in_document_order_and_undo_once(cx: &mut Test
             d.as_str(),
             e.as_str()
         ]));
-        assert_eq!(editor.views[&b].source, "peer B");
+        assert_eq!(editor.views[&b].content.plain_text(), "peer B");
     });
     // After a completed drop, Shift-click starts a fresh selection rather
     // than extending from the last dragged block's stale anchor.
@@ -326,20 +326,20 @@ fn selecting_all_items_drags_the_original_list_container(cx: &mut TestAppContext
         (
             sections
                 .iter()
-                .find(|block| block.markdown == "three")
+                .find(|block| block.content.plain_text() == "three")
                 .unwrap()
                 .id
                 .clone(),
             sections
                 .iter()
-                .find(|block| block.markdown == "Tail")
+                .find(|block| block.content.plain_text() == "Tail")
                 .unwrap()
                 .id
                 .clone(),
             group.clone(),
             sections
                 .iter()
-                .filter(|block| block.id != group && block.markdown != "Tail")
+                .filter(|block| block.id != group && block.content.plain_text() != "Tail")
                 .map(|block| block.id.clone())
                 .collect::<Vec<_>>(),
         )
@@ -399,14 +399,14 @@ fn alt_selection_moves_a_single_item_list_before_another_list(cx: &mut TestAppCo
         let sections = editor.document.sections();
         let other = sections
             .iter()
-            .find(|block| block.markdown == "other")
+            .find(|block| block.content.plain_text() == "other")
             .unwrap();
         (
             editor.views[&only].parent.clone().unwrap(),
             other.parent.clone().unwrap(),
             sections
                 .iter()
-                .find(|block| block.markdown == "Tail")
+                .find(|block| block.content.plain_text() == "Tail")
                 .unwrap()
                 .id
                 .clone(),
@@ -454,7 +454,7 @@ fn dragging_a_parent_onto_its_descendant_is_a_silent_noop(cx: &mut TestAppContex
                 .document
                 .sections()
                 .iter()
-                .find(|block| block.markdown == "child")
+                .find(|block| block.content.plain_text() == "child")
                 .unwrap()
                 .id
                 .clone(),

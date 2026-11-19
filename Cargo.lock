@@ -2658,6 +2658,8 @@ dependencies = [
  "gpui-kit-markdown-editor",
  "markdown",
  "mermaid-rs-renderer",
+ "serde",
+ "serde_json",
  "similar",
  "unicode-segmentation",
  "uuid",
@@ -2667,12 +2669,13 @@ dependencies = [
 [[package]]
 name = "gpui-kit-markdown-editor"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48a9a57e4f567563e017a64a8450ac71b55f94e0fd917d453d56365c67161ff4"
 dependencies = [
  "gpui-kit",
  "markdown",
+ "serde",
+ "serde_json",
  "unicode-segmentation",
+ "uuid",
 ]
 
 [[package]]
