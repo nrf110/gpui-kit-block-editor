@@ -5,7 +5,7 @@
 //! Markdown and JSON are explicit boundaries, never collaborative storage.
 
 use crate::block::{BlockSpec, SectionKind};
-use markdown_editor::rich::{RICH_DOCUMENT_VERSION, RichDocument};
+use markdown_editor::rich::{RICH_DOCUMENT_VERSION, RichDocument, RichKind};
 use serde::{Deserialize, Serialize};
 #[path = "rich_storage.rs"]
 mod rich_storage;
@@ -1222,6 +1222,69 @@ impl Document {
             }
             result.sort_unstable_by(|left, right| left.0.cmp(&right.0));
             Ok(result)
+        })
+    }
+
+    /// Remove an empty text block without deleting its descendants.
+    /// A final list item becomes the document's remaining typing paragraph.
+    pub(crate) fn remove_empty_block(&mut self, id: &str) -> Result<bool> {
+        let sections = self.sections();
+        let section = sections
+            .iter()
+            .find(|section| section.id == id)
+            .ok_or_else(|| anyhow!("unknown section: {id}"))?;
+        if !matches!(
+            section.kind,
+            SectionKind::Text | SectionKind::ListItem { .. }
+        ) || !section.content.blocks.iter().all(|node| {
+            matches!(node.kind, RichKind::Paragraph | RichKind::Heading)
+                && node.children.is_empty()
+                && node
+                    .runs
+                    .iter()
+                    .all(|run| run.atom.is_none() && run.text.is_empty())
+        }) {
+            return Ok(false);
+        }
+        let in_list = matches!(section.kind, SectionKind::ListItem { .. });
+        if sections
+            .iter()
+            .filter(|section| section.kind.is_editable())
+            .take(2)
+            .count()
+            == 1
+        {
+            return if in_list {
+                self.exit_list_item(id)
+            } else {
+                Ok(false)
+            };
+        }
+        let has_children = sections
+            .iter()
+            .any(|child| child.parent.as_deref() == Some(id));
+        let parent = if in_list && has_children {
+            sections
+                .iter()
+                .find(|group| Some(&group.id) == section.parent.as_ref())
+                .ok_or_else(|| anyhow!("list item has no list"))?
+                .parent
+                .as_deref()
+        } else {
+            section.parent.as_deref()
+        };
+        self.command(|document| {
+            if in_list && has_children {
+                document.exit_list_item(id)?;
+            }
+            for child in sections
+                .iter()
+                .filter(|child| child.parent.as_deref() == Some(id))
+            {
+                document.reparent_section(&child.id, parent, Some(id))?;
+            }
+            document.remove_section(id)?;
+            Ok(true)
         })
     }
 

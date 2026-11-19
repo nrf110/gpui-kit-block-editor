@@ -539,6 +539,7 @@ impl Element for EditorRoot {
                 &self.snapshot.tables,
             );
             frame.content = Some(self.content_bounds.get());
+            frame.viewport = Some(window.content_mask().bounds);
             {
                 let state = self.state.read(cx);
                 let doc = &state.model.doc;

@@ -69,6 +69,26 @@ fn caret_at(
     });
 }
 
+fn select_range(
+    editor: &Entity<BlockEditorState>,
+    cx: &mut VisualTestContext,
+    anchor: (usize, usize),
+    head: (usize, usize),
+) {
+    editor.update(cx, |e, cx| {
+        let position = |(leaf, offset)| {
+            let id = e.model().document().leaves().nth(leaf).unwrap().id();
+            BlockPosition::new(id, offset)
+        };
+        let selection = BlockSelection::Text {
+            anchor: position(anchor),
+            head: position(head),
+        };
+        e.set_selection(selection, cx).unwrap();
+    });
+    draw(cx);
+}
+
 fn type_text(cx: &mut VisualTestContext, text: &str) {
     cx.simulate_input(text);
     draw(cx);
@@ -785,6 +805,188 @@ impl Render for Scrolled {
             .track_scroll(&self.1)
             .child(BlockEditor::new(&self.0))
     }
+}
+
+#[gpui::test]
+fn selection_bounds_tracks_unicode_glyphs_and_reversed_ranges(cx: &mut TestAppContext) {
+    let selected = "é👩‍💻e\u{301}";
+    let (editor, cx) = open(cx, &format!("prefix **{selected}** suffix"));
+    let lo = "prefix ".len();
+    let hi = lo + selected.len();
+    select_range(&editor, cx, (0, lo), (0, hi));
+    let forward = editor.read_with(cx, |e, _| {
+        let bounds = e.selection_bounds().expect("visible text range");
+        let frame = e.frame.borrow();
+        let leaf = &frame.leaves[0];
+        let a = leaf.caret_point(lo);
+        let b = leaf.caret_point(hi);
+        assert_eq!(bounds.left(), a.x);
+        assert_eq!(bounds.right(), b.x);
+        assert_eq!(bounds.top(), a.y);
+        assert_eq!(bounds.bottom(), a.y + leaf.line_height());
+        assert!(bounds.size.width < leaf.bounds().size.width);
+        bounds
+    });
+    select_range(&editor, cx, (0, hi), (0, lo));
+    assert_eq!(
+        editor.read_with(cx, |e, _| e.selection_bounds()),
+        Some(forward)
+    );
+}
+
+#[gpui::test]
+fn selection_bounds_includes_wider_rows_between_wrapped_endpoints(cx: &mut TestAppContext) {
+    let text = "word ".repeat(100);
+    let (editor, cx) = open(cx, &text);
+    let (end, widest, endpoints) = editor.read_with(cx, |e, _| {
+        let frame = e.frame.borrow();
+        let leaf = &frame.leaves[0];
+        let first = leaf.caret_point(0);
+        let end = text
+            .char_indices()
+            .find(|(offset, _)| leaf.caret_point(*offset).y >= first.y + leaf.line_height() * 3.)
+            .expect("paragraph wraps to at least four rows")
+            .0
+            + 1;
+        let widest = text[..end]
+            .char_indices()
+            .map(|(offset, _)| leaf.caret_point(offset).x)
+            .max()
+            .unwrap();
+        (end, widest, first.x.max(leaf.caret_point(end).x))
+    });
+    assert!(widest > endpoints + px(100.));
+    select_range(&editor, cx, (0, 0), (0, end));
+    editor.read_with(cx, |e, _| {
+        let bounds = e.selection_bounds().expect("wrapped selection");
+        let frame = e.frame.borrow();
+        assert!(bounds.right() >= widest);
+        assert!(bounds.size.height >= frame.leaves[0].line_height() * 4.);
+    });
+}
+
+#[gpui::test]
+fn selection_bounds_includes_intermediate_native_leaves(cx: &mut TestAppContext) {
+    let middle = "the entire wider middle paragraph is selected";
+    let (editor, cx) = open(cx, &format!("start\n\n{middle}\n\nend"));
+    select_range(&editor, cx, (0, 4), (2, 1));
+    let bounds = editor.read_with(cx, |e, _| {
+        let bounds = e.selection_bounds().expect("cross-leaf selection");
+        let frame = e.frame.borrow();
+        let first = frame.leaves[0].caret_point(4);
+        let last = frame.leaves[2].caret_point(1);
+        assert_eq!(bounds.left(), frame.leaves[1].caret_point(0).x);
+        assert_eq!(bounds.right(), frame.leaves[1].caret_point(middle.len()).x);
+        assert!(bounds.right() > first.x.max(last.x) + px(100.));
+        assert_eq!(bounds.top(), first.y);
+        assert_eq!(bounds.bottom(), last.y + frame.leaves[2].line_height());
+        bounds
+    });
+    select_range(&editor, cx, (2, 1), (0, 4));
+    assert_eq!(
+        editor.read_with(cx, |e, _| e.selection_bounds()),
+        Some(bounds)
+    );
+}
+
+#[gpui::test]
+fn selection_bounds_hides_for_carets_objects_readonly_and_composition(cx: &mut TestAppContext) {
+    let (editor, cx) = open(cx, "first\n\nsecond");
+    assert_eq!(editor.read_with(cx, |e, _| e.selection_bounds()), None);
+    select_range(&editor, cx, (0, 1), (0, 4));
+    editor.update(cx, |e, cx| {
+        assert!(e.selection_bounds().is_some());
+        e.set_readonly(true, cx);
+        assert_eq!(e.selection_bounds(), None);
+        e.set_readonly(false, cx);
+        assert!(e.selection_bounds().is_some());
+        let id = e.model().document().leaves().next().unwrap().id();
+        e.set_selection(
+            BlockSelection::Blocks {
+                anchor: id,
+                head: id,
+            },
+            cx,
+        )
+        .unwrap();
+        assert_eq!(e.selection_bounds(), None);
+    });
+    select_range(&editor, cx, (0, 0), (0, 3));
+    cx.update(|window, cx| {
+        editor.update(cx, |e, cx| {
+            e.replace_and_mark_text_in_range(None, "你好", None, window, cx);
+            assert!(e.is_composing());
+            assert_eq!(e.selection_bounds(), None);
+        });
+    });
+}
+
+#[gpui::test]
+fn selection_bounds_ignores_empty_cross_leaf_ranges_and_cell_selections(cx: &mut TestAppContext) {
+    let (editor, cx) = open(cx, TABLE_DOC);
+    // Only the block boundary between "a" and the first table cell is selected.
+    select_range(&editor, cx, (0, 1), (1, 0));
+    assert_eq!(editor.read_with(cx, |e, _| e.selection_bounds()), None);
+    editor.update(cx, |e, cx| {
+        let (anchor, head) = {
+            let mut leaves = e.model().document().leaves();
+            (leaves.nth(1).unwrap().id(), leaves.next().unwrap().id())
+        };
+        e.set_selection(BlockSelection::Cells { anchor, head }, cx)
+            .unwrap();
+        assert_eq!(e.selection_bounds(), None);
+    });
+}
+
+#[gpui::test]
+fn selection_bounds_clips_each_completed_scrolled_frame(cx: &mut TestAppContext) {
+    cx.update(crate::init_for_tests);
+    let handle = gpui::ScrollHandle::new();
+    let scroll = handle.clone();
+    let source = format!("selected text\n\n{}", "other paragraph\n\n".repeat(100));
+    let (root, cx) = cx.add_window_view(move |window, cx| {
+        Scrolled(
+            cx.new(|cx| BlockEditorState::new(window, cx).with_source(&source)),
+            scroll,
+        )
+    });
+    let editor = root.read_with(cx, |root, _| root.0.clone());
+    for _ in 0..3 {
+        draw(cx);
+    }
+    select_range(&editor, cx, (0, 0), (0, "selected text".len()));
+    let before = editor.read_with(cx, |e, _| e.selection_bounds().unwrap());
+    let viewport = handle.bounds();
+    let delta = before.top() - viewport.top() + before.size.height / 2.;
+    handle.set_offset(gpui::point(px(0.), -delta));
+    for _ in 0..3 {
+        draw(cx);
+    }
+    editor.read_with(cx, |e, _| {
+        let clipped = e
+            .selection_bounds()
+            .expect("partially visible selected row");
+        assert_eq!(clipped.top(), viewport.top());
+        assert!((clipped.bottom() - (before.bottom() - delta)).abs() < px(1.));
+        assert_eq!(clipped.size.width, before.size.width);
+        assert!(clipped.size.height < before.size.height);
+    });
+    handle.set_offset(gpui::point(
+        px(0.),
+        -(before.bottom() - viewport.top() + px(5.)),
+    ));
+    for _ in 0..3 {
+        draw(cx);
+    }
+    assert_eq!(editor.read_with(cx, |e, _| e.selection_bounds()), None);
+    handle.set_offset(gpui::point(px(0.), px(0.)));
+    for _ in 0..3 {
+        draw(cx);
+    }
+    assert_eq!(
+        editor.read_with(cx, |e, _| e.selection_bounds()),
+        Some(before)
+    );
 }
 
 /// With a scroll handle, moving the caret into a culled block scrolls it

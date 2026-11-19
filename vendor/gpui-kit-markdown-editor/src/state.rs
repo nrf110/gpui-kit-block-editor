@@ -701,6 +701,26 @@ impl BlockEditorState {
         self.model.selection()
     }
 
+    /// Bounds of the visible highlighted text, in window coordinates.
+    ///
+    /// Read after the editor's prepaint to use the current completed native
+    /// frame, including its wrapping, scrolling and clipping. Returns `None`
+    /// for a caret, block/cell selection, readonly editor, IME composition,
+    /// or a text range with no visible selected glyphs.
+    pub fn selection_bounds(&self) -> Option<Bounds<Pixels>> {
+        if self.readonly || self.marked.is_some() {
+            return None;
+        }
+        if !matches!(self.selection(), BlockSelection::Text { .. }) {
+            return None;
+        }
+        let range = self.model.doc.resolve_selection(self.selection()).ok()?;
+        if range.is_collapsed() {
+            return None;
+        }
+        self.frame.borrow().selection_bounds(&self.model.doc, range)
+    }
+
     /// Kind of the text block holding the caret, if any.
     pub fn block_kind_at_caret(&self) -> Option<BlockKind> {
         self.model.block_kind_at_caret()

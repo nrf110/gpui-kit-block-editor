@@ -10,9 +10,13 @@
 use std::{collections::HashMap, ops::Range, rc::Rc};
 
 use gpui::{Bounds, Pixels, Point, point, px, size};
-use gpui_kit::base::text::editor_host::{ColumnAlign, LeafGeometry};
+use gpui_kit::base::text::editor_host::{Caret, ColumnAlign, LeafGeometry};
+use unicode_segmentation::UnicodeSegmentation as _;
 
-use super::{id::BlockId, position::BlockPosition, projection::LeafInfo};
+use super::{
+    document::EditorDocument, id::BlockId, position::BlockPosition, projection::LeafInfo,
+    selection::ResolvedSelection,
+};
 
 /// Builds the frame from what `collect_leaf_geometry` returned.
 pub(crate) fn into_frame(
@@ -97,6 +101,47 @@ impl LeafGeom {
     pub(crate) fn atom_at(&self, at: Point<Pixels>) -> Option<Range<usize>> {
         self.geometry.atom_at(at)
     }
+
+    /// The public host geometry exposes affinity-aware carets, not range
+    /// rectangles. Measure each selected grapheme on its own visual row:
+    /// endpoint-only bounds miss the wider rows between wrapped endpoints.
+    fn selection_bounds(
+        &self,
+        text: &str,
+        range: Range<usize>,
+        viewport: Bounds<Pixels>,
+    ) -> Option<Bounds<Pixels>> {
+        if self.info.atomic || !self.bounds().intersects(&viewport) {
+            return None;
+        }
+        let selected = text.get(range.clone())?;
+        let line_height = self.line_height();
+        let rendered_len = self.geometry.len();
+        selected
+            .grapheme_indices(true)
+            .filter(|(_, grapheme)| !matches!(*grapheme, "\n" | "\r" | "\r\n" | "\u{fffc}"))
+            .filter_map(|(offset, grapheme)| {
+                let start = range.start + offset;
+                let end = start + grapheme.len();
+                if end > rendered_len {
+                    return None;
+                }
+                // A wrap offset belongs to the next row at the start and
+                // the previous row at the end of a selected grapheme.
+                let a = self.geometry.position_for_caret(Caret::new(start));
+                if a.y >= viewport.bottom() || a.y + line_height <= viewport.top() {
+                    return None;
+                }
+                let b = self.geometry.position_for_caret(Caret::upstream(end));
+                let bounds = Bounds::from_corners(
+                    point(a.x.min(b.x), a.y),
+                    point(a.x.max(b.x), a.y + line_height),
+                )
+                .intersect(&viewport);
+                (bounds.size.width > px(0.) && bounds.size.height > px(0.)).then_some(bounds)
+            })
+            .reduce(|a, b| a.union(&b))
+    }
 }
 
 /// The last complete frame's leaf geometry, in document order.
@@ -113,6 +158,8 @@ pub(crate) struct FrameLayout {
     /// The editor's content area: tables span its width, while their cells'
     /// text bounds only cover the text.
     pub(crate) content: Option<Bounds<Pixels>>,
+    /// The clipping mask in window coordinates, captured with this frame.
+    pub(crate) viewport: Option<Bounds<Pixels>>,
 }
 
 impl FrameLayout {
@@ -127,6 +174,38 @@ impl FrameLayout {
         // GPUI centres the glyphs in the line box: so does the caret.
         origin.y += (line - h) / 2.;
         Some(Bounds::new(origin, size(width, h)))
+    }
+
+    pub(crate) fn selection_bounds(
+        &self,
+        doc: &EditorDocument,
+        range: ResolvedSelection,
+    ) -> Option<Bounds<Pixels>> {
+        let viewport = self.viewport?;
+        let start = doc.order.rank(range.start.block)?;
+        let end = doc.order.rank(range.end.block)?;
+        self.leaves
+            .iter()
+            .filter_map(|leaf| {
+                let id = leaf.info.block;
+                let rank = doc.order.rank(id)?;
+                if rank < start || rank > end {
+                    return None;
+                }
+                let text = doc.leaf_text(id)?;
+                let lo = if id == range.start.block {
+                    range.start.offset
+                } else {
+                    0
+                };
+                let hi = if id == range.end.block {
+                    range.end.offset
+                } else {
+                    text.len()
+                };
+                leaf.selection_bounds(text, lo..hi, viewport)
+            })
+            .reduce(|a, b| a.union(&b))
     }
 
     /// The table under a window point.

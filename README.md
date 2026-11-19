@@ -28,6 +28,7 @@ The backend is a vendored extension of [gpui-kit-markdown-editor 0.3.0](https://
 ## Editing
 
 - Enter/Shift+Enter creates and focuses a sibling block. Code and table cells retain native internal-line editing. Markdown import splits ordinary paragraph lines into blocks, while preserving explicit hard breaks and keeping code/tables atomic.
+- **Backspace / Delete** at the start of an empty paragraph, heading, or list item removes it and focuses a neighboring block. Backspace prefers the previous block's end; Delete prefers the next block's start. Nested content is promoted rather than deleted, and empty list/quote containers are pruned. The final empty paragraph remains editable; a lone empty list item becomes a plain paragraph. Removal is one collaborative undo step.
 - **Tab / Shift+Tab** nests and unnests blocks when the slash menu is closed. Nested children move with their parent. Enter on an empty list item exits its list; new task items start unchecked.
 - Hover a row to reveal its vertically centered **+** command button, **⠿** grip, and trash icon. Drop on another row to move before it, including across lists. A list's end strip appends to that list; strips before/after lists pull items to the parent level. The document's bottom drop area moves items out to the top level. Lists renumber automatically.
 - Click a grip to select a block. **Shift-click** selects a visible range; **Cmd/Ctrl-click** toggles individual blocks; **Escape** clears selection. Drag a selected grip to move the selection in document order. A multi-block selection covering every item moves the original list container; **Alt/Option-click** explicitly selects a whole list, including a one-item list.
@@ -35,6 +36,16 @@ The backend is a vendored extension of [gpui-kit-markdown-editor 0.3.0](https://
 - The trash icon deletes its block and children. **Add block** creates a top-level paragraph.
 - Click **+** to the left of a block's grip, or type **/**, to open the command menu. Opening with **+** preserves the text and selection without inserting a slash; formatting commands apply to that selection. The **+** menu floats beside its button without moving the block. Wheel scrolling stays inside either menu, including at its scroll limits. Scroll to browse every command, or type **/** and keep typing to filter. **Up/Down** keeps the selected command in view; **Enter/Tab** accepts it and **Escape** dismisses the menu. Commands include headings, marks, lists/tasks, quotes, tables and cell operations, code, Mermaid, and collapsible sections. IME composition is not intercepted.
 - **Cmd/Ctrl+B / I** applies styling. **Cmd/Ctrl+Z / Shift+Z** undoes/redoes this replica's edits without undoing peers' changes. Heading levels provide font sizes; arbitrary font families/point sizes are not exposed by the current native renderer.
+
+### Selection toolbar
+
+Highlight text to show a floating toolbar above the selected glyphs. It follows wrapping and scrolling without moving the document, and flips below the selection when there is no room above. The toolbar offers paragraph/heading 1–6 presets, bold, italic, underline, quote, link editing, collapsible sections, and bulleted, numbered, or task lists.
+
+Style and list choices open separate, keyboard-navigable dropdown menus anchored to their buttons, without adding a toolbar row. Wheel scrolling stays inside each dropdown, even at its scroll limits. Quote, link, collapsible-section, and list controls use embedded icons with hover tooltips and accessible labels.
+
+Inline styles and links affect only the highlighted text. Heading and structural actions affect its containing block, retaining its text and descendants; unavailable conversions are disabled in code/table or container contexts. Formatting preserves the selected range for successive actions. Collapsible conversion expands the section and focuses its new child.
+
+**Link** opens a padded editing row and focuses a URL field prefilled from the selection's existing link. **Apply** or **Enter** saves; **Cancel** or **Escape** discards the draft. **Remove link**, or applying an empty URL, unlinks the text. HTTP, HTTPS, mailto, relative, and fragment URLs are supported; unsafe schemes are rejected without changing the document. The target uses CRDT-relative positions, so peer edits during URL entry do not redirect the action to unrelated text. Toolbar actions participate in local collaborative undo.
 
 ### Collapsible sections
 

@@ -32,6 +32,10 @@ use crate::{
     rich_map::{RichMap, RichPoint, SelectionKind, SelectionOffsets},
 };
 
+#[path = "selection_toolbar.rs"]
+mod selection_toolbar;
+use selection_toolbar::{SelectionDropdown, SelectionLink};
+
 /// Raw Yjs v1 updates. Remote application never echoes a local event.
 #[derive(Clone, Debug)]
 pub enum DocumentEvent {
@@ -237,6 +241,14 @@ pub struct BlockEditor {
     block_selection: HashSet<SectionId>,
     block_anchor: Option<SectionId>,
     completion: Option<Completion>,
+    selection_dropdown: Option<SelectionDropdown>,
+    selection_link: Option<SelectionLink>,
+    selection_toolbar_target: Option<SectionId>,
+    selection_toolbar_focus: FocusHandle,
+    selection_link_icon: Icon,
+    selection_list_icon: Icon,
+    selection_collapsible_icon: Icon,
+    selection_quote_icon: Icon,
     error: Option<String>,
     scroll: ScrollHandle,
     trash_icon: Icon,
@@ -259,6 +271,9 @@ impl BlockEditor {
         let keystrokes = cx.intercept_keystrokes(move |event, window, cx| {
             if let Some(owner) = owner.upgrade() {
                 let handled = owner.update(cx, |this, cx| {
+                    if this.handle_selection_key(&event.keystroke, window, cx) {
+                        return true;
+                    }
                     if event.keystroke.key == "escape"
                         && this.focus_scope.contains_focused(window, cx)
                         && !this.block_selection.is_empty()
@@ -305,6 +320,18 @@ impl BlockEditor {
             block_selection: HashSet::new(),
             block_anchor: None,
             completion: None,
+            selection_dropdown: None,
+            selection_link: None,
+            selection_toolbar_target: None,
+            selection_toolbar_focus: cx.focus_handle().tab_stop(false),
+            selection_link_icon: Icon::default()
+                .data(include_bytes!("../assets/selection-link.svg")),
+            selection_list_icon: Icon::default()
+                .data(include_bytes!("../assets/selection-list.svg")),
+            selection_collapsible_icon: Icon::default()
+                .data(include_bytes!("../assets/selection-list-collapse.svg")),
+            selection_quote_icon: Icon::default()
+                .data(include_bytes!("../assets/selection-quote.svg")),
             error: None,
             scroll: ScrollHandle::new(),
             trash_icon: Icon::default().data(include_bytes!("../assets/trash.svg")),
@@ -329,7 +356,7 @@ impl BlockEditor {
             || key.modifiers.platform
             || key.modifiers.control
             || key.modifiers.alt
-            || !matches!(key.key.as_str(), "tab" | "enter")
+            || !matches!(key.key.as_str(), "tab" | "enter" | "backspace" | "delete")
         {
             return false;
         }
@@ -353,6 +380,34 @@ impl BlockEditor {
             Some(NativeBlockKind::CodeBlock | NativeBlockKind::TableCell)
         ) {
             return false;
+        }
+        if matches!(key.key.as_str(), "backspace" | "delete") {
+            let state = view.editor.read(cx);
+            let native = state.model().document();
+            if state.is_readonly()
+                || !matches!(view.kind, SectionKind::Text | SectionKind::ListItem { .. })
+                || !matches!(state.selection(), BlockSelection::Text { anchor, head }
+                    if anchor == head && *head == native.first_caret())
+                || !native.leaves().all(|leaf| {
+                    matches!(
+                        leaf.kind(),
+                        NativeBlockKind::Paragraph | NativeBlockKind::Heading { .. }
+                    ) && leaf.text().is_some_and(str::is_empty)
+                })
+            {
+                return false;
+            }
+            match self.remove_empty_block(&id, key.key == "backspace", window, cx) {
+                Ok(false) => return false,
+                Err(error) => {
+                    self.error = Some(error.to_string());
+                    cx.notify();
+                }
+                Ok(true) => {}
+            }
+            cx.stop_propagation();
+            window.prevent_default();
+            return true;
         }
         let exit_list = key.key == "enter"
             && !key.modifiers.shift
@@ -399,6 +454,73 @@ impl BlockEditor {
         cx.stop_propagation();
         window.prevent_default();
         true
+    }
+
+    fn remove_empty_block(
+        &mut self,
+        id: &str,
+        backward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<bool> {
+        self.flush_local_edits(window, cx)?;
+        self.capture_selections(cx)?;
+        let index = self
+            .order
+            .iter()
+            .position(|section| section == id)
+            .context("focused block is not visible")?;
+        let previous = if backward {
+            index.checked_sub(1).map(|index| self.order[index].clone())
+        } else {
+            None
+        };
+        let vector = self.document.state_vector();
+        if !self.document.remove_empty_block(id)? {
+            return Ok(false);
+        }
+        self.completion = None;
+        self.selection_dropdown = None;
+        self.selection_link = None;
+        self.reconcile(window, cx);
+        let target = if self.views.contains_key(id) {
+            Some((id.to_owned(), false))
+        } else if backward {
+            previous
+                .map(|id| (id, true))
+                .or_else(|| self.order.get(index).cloned().map(|id| (id, false)))
+        } else {
+            self.order
+                .get(index)
+                .cloned()
+                .map(|id| (id, false))
+                .or_else(|| self.order.last().cloned().map(|id| (id, true)))
+        };
+        if let Some((target, at_end)) = target {
+            let view = self
+                .views
+                .get_mut(&target)
+                .context("neighboring block is not editable")?;
+            view.show_source = true;
+            view.editor.update(cx, |state, cx| -> anyhow::Result<()> {
+                let document = state.model().document();
+                let position = if at_end {
+                    document.last_caret()
+                } else {
+                    document.first_caret()
+                };
+                state
+                    .set_selection(BlockSelection::caret(position), cx)
+                    .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                state.focus(window, cx);
+                Ok(())
+            })?;
+            self.cache_selection(&target, cx)?;
+        } else {
+            self.focus_scope.focus(window, cx);
+        }
+        self.publish(&vector, cx);
+        Ok(true)
     }
 
     fn is_collapsed(&self, id: &str) -> bool {
@@ -1056,6 +1178,7 @@ impl BlockEditor {
         cx: &mut Context<Self>,
     ) -> bool {
         if !(key.modifiers.platform || key.modifiers.control)
+            || self.selection_input_focused(window, cx)
             || key.modifiers.alt
             || !matches!(key.key.as_str(), "z" | "y")
             || !self.focus_scope.contains_focused(window, cx)
@@ -1280,6 +1403,10 @@ impl BlockEditor {
                             BlockEditorEvent::SelectionChanged => this
                                 .sync_native_change(&id, None, window, cx)
                                 .and_then(|_| this.cache_selection(&id, cx)),
+                            BlockEditorEvent::Focus | BlockEditorEvent::Blur => {
+                                cx.notify();
+                                return;
+                            }
                             _ => return,
                         };
                         if let Err(error) = result {
@@ -1401,6 +1528,8 @@ impl BlockEditor {
         let Some(view) = self.views.get_mut(id) else {
             return;
         };
+        self.selection_dropdown = None;
+        self.selection_link = None;
         view.show_source = true;
         view.editor.update(cx, |state, cx| state.focus(window, cx));
         if !self
@@ -1470,18 +1599,33 @@ impl BlockEditor {
     }
 
     fn accept_completion(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(mut completion) = self.completion.take() else {
+        let Some(completion) = self.completion.take() else {
             return;
         };
-        let Some(command) = completion.commands.get(index).cloned() else {
+        let Some(action) = completion
+            .commands
+            .get(index)
+            .map(|command| command.action.clone())
+        else {
             return;
         };
-        let Some(view) = self.views.get(&completion.section) else {
+        self.execute_command(&completion.section, action, completion.range, window, cx);
+    }
+
+    fn execute_command(
+        &mut self,
+        id: &str,
+        action: CommandAction,
+        mut range: Option<CapturedRange>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.views.get(id) else {
             return;
         };
         let editor = view.editor.clone();
         let structural = matches!(
-            &command.action,
+            &action,
             CommandAction::Editor(
                 EditorCommand::ToggleList { .. }
                     | EditorCommand::ToggleTask
@@ -1493,12 +1637,12 @@ impl BlockEditor {
         self.document.begin_history_group();
         let result = (|| -> anyhow::Result<()> {
             let native = editor.update(cx, |state, cx| -> anyhow::Result<()> {
-                if let Some(range) = &mut completion.range {
+                if let Some(range) = &mut range {
                     state
                         .replace_captured(range, "", cx)
                         .map_err(|error| anyhow::anyhow!("{error:?}"))?;
                 }
-                if let CommandAction::Editor(command) = &command.action {
+                if let CommandAction::Editor(command) = &action {
                     if !structural {
                         state
                             .run(command.clone(), cx)
@@ -1508,35 +1652,25 @@ impl BlockEditor {
                 state.focus(window, cx);
                 Ok(())
             });
-            self.sync_native_change(
-                &completion.section,
-                Some(EditOrigin::Command("slash")),
-                window,
-                cx,
-            )?;
+            self.sync_native_change(id, Some(EditOrigin::Command("format")), window, cx)?;
             native?;
-            match command.action {
+            match action {
                 CommandAction::InsertMarkdown(markdown) => {
-                    self.insert_markup_after(&completion.section, &markdown, window, cx)?
+                    self.insert_markup_after(id, &markdown, window, cx)?
                 }
                 CommandAction::Editor(command) if structural => {
                     let vector = self.document.state_vector();
                     match command {
                         EditorCommand::ToggleList { ordered } => {
-                            self.document
-                                .wrap_list(&completion.section, ordered, false)?
+                            self.document.wrap_list(id, ordered, false)?
                         }
-                        EditorCommand::ToggleTask => {
-                            self.document.wrap_list(&completion.section, false, true)?
-                        }
-                        EditorCommand::ToggleBlockquote => {
-                            self.document.wrap_quote(&completion.section)?
-                        }
+                        EditorCommand::ToggleTask => self.document.wrap_list(id, false, true)?,
+                        EditorCommand::ToggleBlockquote => self.document.wrap_quote(id)?,
                         EditorCommand::Indent => {
-                            self.document.indent_section(&completion.section)?;
+                            self.document.indent_section(id)?;
                         }
                         EditorCommand::Outdent => {
-                            self.document.outdent_section(&completion.section)?;
+                            self.document.outdent_section(id)?;
                         }
                         _ => unreachable!("structural command matched above"),
                     }
@@ -1545,8 +1679,8 @@ impl BlockEditor {
                 }
                 CommandAction::Collapsible => {
                     let vector = self.document.state_vector();
-                    let child = self.document.wrap_collapsible(&completion.section)?;
-                    self.collapsed.insert(completion.section.clone(), false);
+                    let child = self.document.wrap_collapsible(id)?;
+                    self.collapsed.insert(id.to_owned(), false);
                     self.reconcile(window, cx);
                     self.focus_block_at(&child, None, window, cx)?;
                     self.publish(&vector, cx);
@@ -2333,6 +2467,9 @@ impl Render for BlockEditor {
                     .p_5()
                     .child(content),
             )
+            .when_some(self.selection_toolbar(window, cx), |el, toolbar| {
+                el.child(toolbar)
+            })
     }
 }
 
@@ -2355,3 +2492,7 @@ mod drag_tests;
 #[cfg(test)]
 #[path = "collapsible_editor_tests.rs"]
 mod collapsible_tests;
+
+#[cfg(test)]
+#[path = "selection_toolbar_tests.rs"]
+mod selection_toolbar_tests;

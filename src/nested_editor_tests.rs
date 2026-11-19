@@ -1,7 +1,7 @@
 use super::SectionKind;
 use super::collaboration_tests::{replica, select, set_text, setup};
 use gpui_kit::test::TestWindowExt;
-use gpui_kit::{AppContext, SharedString, TestAppContext};
+use gpui_kit::{AppContext, Focusable, SharedString, TestAppContext};
 
 #[gpui_kit::test]
 fn enter_splits_a_rich_block_and_undo_restores_it(cx: &mut TestAppContext) {
@@ -382,4 +382,262 @@ fn enter_in_an_empty_block_creates_editable_siblings(cx: &mut TestAppContext) {
             vec!["", "", "text"]
         );
     });
+}
+
+#[gpui_kit::test]
+fn backspace_removes_repeated_empty_newlines_and_undo_restores_each_block(cx: &mut TestAppContext) {
+    let (handle, editor, first) = setup("**α😀**", cx);
+    cx.update_window(handle, |_, window, cx| {
+        select(&editor, &first, 0, 6, 6, window, cx);
+        window.render_frame(cx);
+        for _ in 0..3 {
+            window.press("enter", cx);
+        }
+    })
+    .unwrap();
+    let original = editor.read_with(cx, |editor, _| editor.document.sections());
+    assert_eq!(original.len(), 4);
+    cx.update_window(handle, |_, window, cx| {
+        editor.update(cx, |editor, _| editor.document.clear_history());
+        for remaining in (1..4).rev() {
+            window.press("backspace", cx);
+            assert_eq!(editor.read(cx).document.sections().len(), remaining);
+        }
+        let state = editor.read(cx).views[&first].editor.read(cx);
+        assert!(state.focus_handle(cx).is_focused(window));
+        assert_eq!(state.model().caret().unwrap().offset, 6);
+        assert_eq!(editor.read(cx).markdown().trim(), "**α😀**");
+        for _ in 0..3 {
+            window.press("cmd-z", cx);
+        }
+        assert_eq!(editor.read(cx).document.sections(), original);
+        assert!(
+            editor.read(cx).error.is_none(),
+            "{:?}",
+            editor.read(cx).error
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn forward_delete_removes_an_empty_first_block_and_keeps_the_next_block_editable(
+    cx: &mut TestAppContext,
+) {
+    let (handle, editor, empty) = setup("", cx);
+    let next = cx
+        .update_window(handle, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.insert_section(None, "**Next**", window, cx).unwrap()
+            })
+        })
+        .unwrap();
+    cx.update_window(handle, |_, window, cx| {
+        select(&editor, &empty, 0, 0, 0, window, cx);
+        window.render_frame(cx);
+        window.press("delete", cx);
+        assert!(!editor.read(cx).views.contains_key(&empty));
+        let state = editor.read(cx).views[&next].editor.read(cx);
+        assert!(state.focus_handle(cx).is_focused(window));
+        assert_eq!(state.model().caret().unwrap().offset, 0);
+        window.input("X", cx);
+    })
+    .unwrap();
+    editor.read_with(cx, |editor, _| {
+        assert_eq!(editor.order, vec![next.clone()]);
+        assert_eq!(editor.views[&next].content.plain_text(), "XNext");
+        assert!(editor.error.is_none(), "{:?}", editor.error);
+    });
+}
+
+#[gpui_kit::test]
+fn backspace_deletes_a_new_empty_task_item_and_syncs_the_deletion(cx: &mut TestAppContext) {
+    let (handle, editor, one) = setup("- [x] one\n- [ ] tail", cx);
+    cx.update_window(handle, |_, window, cx| {
+        select(&editor, &one, 0, 3, 3, window, cx);
+        window.render_frame(cx);
+        window.press("enter", cx);
+    })
+    .unwrap();
+    let original = editor.read_with(cx, |editor, _| editor.document.sections());
+    let empty = editor.read_with(cx, |editor, _| editor.order[1].clone());
+    let mut remote = replica(&editor, cx);
+    let vector = remote.state_vector();
+    cx.update_window(handle, |_, window, cx| {
+        editor.update(cx, |editor, _| editor.document.clear_history());
+        window.press("backspace", cx);
+        assert!(!editor.read(cx).views.contains_key(&empty));
+        assert_eq!(
+            editor.read(cx).views[&one].kind,
+            SectionKind::ListItem {
+                checked: Some(true)
+            }
+        );
+        assert_eq!(
+            editor
+                .read(cx)
+                .document
+                .children(editor.read(cx).views[&one].parent.as_deref())
+                .len(),
+            2
+        );
+    })
+    .unwrap();
+    let update = editor.read_with(cx, |editor, _| {
+        editor.document.encode_update(&vector).unwrap()
+    });
+    remote.apply_update(&update).unwrap();
+    editor.read_with(cx, |editor, _| {
+        assert_eq!(remote.sections(), editor.document.sections())
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.press("cmd-z", cx);
+        assert_eq!(editor.read(cx).document.sections(), original);
+        assert!(!editor.read(cx).document.can_undo());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn clearing_then_backspacing_the_last_list_item_prunes_its_empty_group(cx: &mut TestAppContext) {
+    let (handle, editor, before) = setup("Before\n\n- [ ] erase", cx);
+    let item = editor.read_with(cx, |editor, _| editor.order[1].clone());
+    cx.update_window(handle, |_, window, cx| {
+        select(&editor, &item, 0, 0, 5, window, cx);
+        window.render_frame(cx);
+        window.press("backspace", cx);
+        window.press("backspace", cx);
+    })
+    .unwrap();
+    editor.read_with(cx, |editor, _| {
+        assert_eq!(editor.document.sections().len(), 1);
+        assert_eq!(editor.order, vec![before.clone()]);
+        assert_eq!(editor.views[&before].content.plain_text(), "Before");
+        assert!(editor.error.is_none(), "{:?}", editor.error);
+    });
+}
+
+#[gpui_kit::test]
+fn the_only_empty_list_item_becomes_a_typing_paragraph_and_the_last_paragraph_is_retained(
+    cx: &mut TestAppContext,
+) {
+    let (handle, editor, item) = setup("1. erase", cx);
+    cx.update_window(handle, |_, window, cx| {
+        select(&editor, &item, 0, 0, 5, window, cx);
+        window.render_frame(cx);
+        window.press("backspace", cx);
+        window.press("backspace", cx);
+    })
+    .unwrap();
+    editor.read_with(cx, |editor, _| {
+        assert_eq!(editor.document.sections().len(), 1);
+        assert_eq!(editor.views[&item].kind, SectionKind::Text);
+    });
+    let vector = editor.read_with(cx, |editor, _| editor.document.state_vector());
+    cx.update_window(handle, |_, window, cx| {
+        window.press("backspace", cx);
+        window.press("delete", cx);
+        assert_eq!(editor.read(cx).document.state_vector(), vector);
+        window.input("Still editable", cx);
+    })
+    .unwrap();
+    editor.read_with(cx, |editor, _| {
+        assert_eq!(editor.views[&item].content.plain_text(), "Still editable");
+        assert!(editor.error.is_none(), "{:?}", editor.error);
+    });
+}
+
+#[gpui_kit::test]
+fn deleting_an_empty_parent_promotes_its_children_instead_of_deleting_them(
+    cx: &mut TestAppContext,
+) {
+    let (handle, editor, parent) = setup("parent\n\nAfter", cx);
+    let child = cx
+        .update_window(handle, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                let child = editor
+                    .document
+                    .insert_block(
+                        Some(&parent),
+                        None,
+                        &crate::BlockSpec {
+                            kind: SectionKind::Text,
+                            content: crate::RichDocument::paragraph("Retained child"),
+                            children: vec![],
+                        },
+                    )
+                    .unwrap();
+                editor.reconcile(window, cx);
+                child
+            })
+        })
+        .unwrap();
+    cx.update_window(handle, |_, window, cx| {
+        select(&editor, &parent, 0, 0, 6, window, cx);
+        window.render_frame(cx);
+        window.press("backspace", cx);
+        window.press("backspace", cx);
+        assert!(!editor.read(cx).views.contains_key(&parent));
+        assert!(editor.read(cx).views[&child].parent.is_none());
+        assert_eq!(editor.read(cx).order[0], child);
+        assert!(
+            editor.read(cx).views[&child]
+                .editor
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        );
+    })
+    .unwrap();
+    editor.read_with(cx, |editor, _| {
+        assert_eq!(editor.views[&child].content.plain_text(), "Retained child");
+        assert!(editor.error.is_none(), "{:?}", editor.error);
+    });
+}
+
+#[gpui_kit::test]
+fn deleting_an_empty_list_parent_preserves_nested_content_and_peer_edits_through_undo(
+    cx: &mut TestAppContext,
+) {
+    let (handle, editor, before) = setup("- before\n- parent\n  - **child**\n- after", cx);
+    let (parent, child) = editor.read_with(cx, |editor, _| {
+        (editor.order[1].clone(), editor.order[2].clone())
+    });
+    cx.update_window(handle, |_, window, cx| {
+        select(&editor, &parent, 0, 0, 6, window, cx);
+        window.render_frame(cx);
+        window.press("backspace", cx);
+    })
+    .unwrap();
+    let mut remote = replica(&editor, cx);
+    let vector = remote.state_vector();
+    let mut child_content = remote
+        .sections()
+        .into_iter()
+        .find(|section| section.id == child)
+        .unwrap()
+        .content;
+    child_content.blocks[0].runs[0].text.insert_str(0, "Peer ");
+    remote.set_content(&child, &child_content).unwrap();
+    let update = remote.encode_update(&vector).unwrap();
+    cx.update_window(handle, |_, window, cx| {
+        editor.update(cx, |editor, _| editor.document.clear_history());
+        window.press("backspace", cx);
+        assert!(!editor.read(cx).views.contains_key(&parent));
+        assert_eq!(editor.read(cx).order[0], before);
+        editor.update(cx, |editor, cx| {
+            editor.apply_update(&update, window, cx).unwrap()
+        });
+        assert_eq!(editor.read(cx).views[&child].content, child_content);
+        window.press("cmd-z", cx);
+        assert!(editor.read(cx).views.contains_key(&parent));
+        assert_eq!(editor.read(cx).views[&child].content, child_content);
+        assert!(!editor.read(cx).document.can_undo());
+        assert!(
+            editor.read(cx).error.is_none(),
+            "{:?}",
+            editor.read(cx).error
+        );
+    })
+    .unwrap();
 }
