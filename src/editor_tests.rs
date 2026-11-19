@@ -1,8 +1,9 @@
+use super::collaboration_tests::{select, setup as setup_content};
 use super::{BlockEditor, Document, ExtensionRegistry};
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{
-    AnyWindowHandle, AppContext, Bounds, Entity, SharedString, TestAppContext, WindowBounds,
-    WindowOptions, point, px, size,
+    AnyWindowHandle, AppContext, Bounds, Entity, ScrollDelta, SharedString, TestAppContext,
+    WindowBounds, WindowOptions, point, px, size,
 };
 
 fn setup(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<BlockEditor>) {
@@ -150,6 +151,11 @@ fn section_controls_follow_hover_and_trash_deletes_only_its_section(cx: &mut Tes
         window.render_frame(cx);
         assert!(
             !window
+                .try_find(("block-menu", 0usize))
+                .is_some_and(|control| control.visible())
+        );
+        assert!(
+            !window
                 .try_find(("grip", 0usize))
                 .is_some_and(|control| control.visible())
         );
@@ -162,6 +168,11 @@ fn section_controls_follow_hover_and_trash_deletes_only_its_section(cx: &mut Tes
 
         window.hover(SharedString::from(first.clone()), cx);
         assert!(window.find(("grip", 0usize)).visible());
+        let plus = window.find(("block-menu", 0usize));
+        let grip = window.find(("grip", 0usize));
+        assert!(plus.visible());
+        assert!(plus.bounds().right() <= grip.bounds().left());
+        assert!((plus.bounds().center().y - grip.bounds().center().y).abs() < px(0.5));
         assert!(window.find(("remove", 0usize)).visible());
         assert!(
             (window.find(("grip", 0usize)).bounds().center().y - bounds.center().y).abs() < px(0.5)
@@ -184,6 +195,11 @@ fn section_controls_follow_hover_and_trash_deletes_only_its_section(cx: &mut Tes
         window.hover(SharedString::from(second.clone()), cx);
         assert!(
             !window
+                .try_find(("block-menu", 0usize))
+                .is_some_and(|control| control.visible())
+        );
+        assert!(
+            !window
                 .try_find(("grip", 0usize))
                 .is_some_and(|control| control.visible())
         );
@@ -193,6 +209,7 @@ fn section_controls_follow_hover_and_trash_deletes_only_its_section(cx: &mut Tes
                 .is_some_and(|control| control.visible())
         );
         assert!(window.find(("grip", 1usize)).visible());
+        assert!(window.find(("block-menu", 1usize)).visible());
         assert!(window.find(("remove", 1usize)).visible());
         let section_bounds = window.find(SharedString::from(second.clone())).bounds();
         assert!(
@@ -214,6 +231,11 @@ fn section_controls_follow_hover_and_trash_deletes_only_its_section(cx: &mut Tes
     });
     cx.update_window(handle, |_, window, cx| {
         window.hover("add-section", cx);
+        assert!(
+            !window
+                .try_find(("block-menu", 0usize))
+                .is_some_and(|control| control.visible())
+        );
         assert!(
             !window
                 .try_find(("grip", 0usize))
@@ -383,6 +405,154 @@ fn invalid_diagram_can_switch_to_source_and_other_code_has_no_toggle(cx: &mut Te
         );
         window.click(("toggle-preview", 1usize), cx);
         assert!(window.find(("section-preview", 1usize)).visible());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn plus_menu_preserves_selected_text_and_escape_does_not_edit(cx: &mut TestAppContext) {
+    let (handle, editor, id) = setup_content("Hello world", cx);
+    let vector = editor.read_with(cx, |editor, _| editor.document.state_vector());
+    cx.update_window(handle, |_, window, cx| {
+        select(&editor, &id, 0, 0, 5, window, cx);
+        window.render_frame(cx);
+        window.hover(SharedString::from(id.clone()), cx);
+        let row_bounds = window.find(SharedString::from(id.clone())).bounds();
+        let button_bounds = window.find(("block-menu", 0usize)).bounds();
+        window.click(("block-menu", 0usize), cx);
+        let menu_bounds = window.find("slash-menu").bounds();
+        assert!((menu_bounds.left() - button_bounds.left()).abs() < px(1.));
+        assert!(menu_bounds.top() >= button_bounds.bottom());
+        assert!(menu_bounds.top() - button_bounds.bottom() <= px(8.));
+        assert_eq!(
+            window.find(SharedString::from(id.clone())).bounds(),
+            row_bounds
+        );
+        assert!(window.find("bold").visible());
+        assert_eq!(editor.read(cx).document.state_vector(), vector);
+        window.press("escape", cx);
+        assert!(editor.read(cx).completion.is_none());
+        assert_eq!(editor.read(cx).document.state_vector(), vector);
+        window.hover(SharedString::from(id.clone()), cx);
+        window.click(("block-menu", 0usize), cx);
+        window.click("bold", cx);
+    })
+    .unwrap();
+    editor.read_with(cx, |editor, _| {
+        assert_eq!(editor.markdown().trim(), "**Hello** world");
+        assert!(editor.error.is_none(), "{:?}", editor.error);
+    });
+    cx.update_window(handle, |_, window, cx| window.press("cmd-z", cx))
+        .unwrap();
+    editor.read_with(cx, |editor, _| {
+        assert_eq!(editor.markdown().trim(), "Hello world");
+    });
+}
+
+#[gpui_kit::test]
+fn plus_menu_keyboard_command_targets_its_block_not_the_previously_focused_one(
+    cx: &mut TestAppContext,
+) {
+    let (handle, editor, first) = setup_content("First", cx);
+    let second = cx
+        .update_window(handle, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.insert_section(None, "Second", window, cx).unwrap()
+            })
+        })
+        .unwrap();
+    cx.update_window(handle, |_, window, cx| {
+        select(&editor, &first, 0, 0, 0, window, cx);
+        window.render_frame(cx);
+        window.hover(SharedString::from(second.clone()), cx);
+        window.click(("block-menu", 1usize), cx);
+        let index = editor
+            .read(cx)
+            .completion
+            .as_ref()
+            .unwrap()
+            .commands
+            .iter()
+            .position(|command| command.id == "collapsible")
+            .unwrap();
+        for _ in 0..index {
+            window.press("down", cx);
+        }
+        window.press("enter", cx);
+    })
+    .unwrap();
+    editor.read_with(cx, |editor, _| {
+        assert_eq!(editor.views[&first].kind, super::SectionKind::Text);
+        assert_eq!(editor.views[&first].content.plain_text(), "First");
+        assert!(matches!(
+            editor.views[&second].kind,
+            super::SectionKind::Collapsible { .. }
+        ));
+        assert_eq!(editor.views[&second].content.plain_text(), "Second");
+        assert_eq!(editor.document.children(Some(&second)).len(), 1);
+        assert!(editor.error.is_none(), "{:?}", editor.error);
+    });
+}
+
+#[gpui_kit::test]
+fn command_menu_wheel_scrolling_does_not_scroll_the_document_even_at_its_edges(
+    cx: &mut TestAppContext,
+) {
+    let (handle, editor, first) = setup_content("First", cx);
+    cx.update_window(handle, |_, window, cx| {
+        editor.update(cx, |editor, cx| {
+            for _ in 0..40 {
+                editor
+                    .document
+                    .insert_section(None, "Another block")
+                    .unwrap();
+            }
+            editor.reconcile(window, cx);
+        });
+        select(&editor, &first, 0, 0, 0, window, cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let page_offset = editor.read_with(cx, |editor, _| editor.scroll.offset());
+    for via_button in [true, false] {
+        cx.update_window(handle, |_, window, cx| {
+            if via_button {
+                window.hover(SharedString::from(first.clone()), cx);
+                window.click(("block-menu", 0usize), cx);
+            } else {
+                window.input("/", cx);
+                window.render_frame(cx);
+            }
+        })
+        .unwrap();
+        let menu_scroll = editor.read_with(cx, |editor, _| {
+            editor.completion.as_ref().unwrap().scroll.clone()
+        });
+        cx.update_window(handle, |_, window, cx| {
+            for delta in [-120., -10_000., -10_000., 10_000., 10_000.] {
+                window.scroll(
+                    "slash-menu-items",
+                    ScrollDelta::Pixels(point(px(0.), px(delta))),
+                    cx,
+                );
+                assert_eq!(editor.read(cx).scroll.offset(), page_offset);
+                if delta < 0. {
+                    assert!(menu_scroll.offset().y < px(0.));
+                } else {
+                    assert_eq!(menu_scroll.offset().y, px(0.));
+                }
+            }
+            window.press("escape", cx);
+        })
+        .unwrap();
+    }
+    cx.update_window(handle, |_, window, cx| {
+        window.scroll(
+            SharedString::from(first),
+            ScrollDelta::Pixels(point(px(0.), px(-120.))),
+            cx,
+        );
+        assert!(editor.read(cx).scroll.offset().y < page_offset.y);
     })
     .unwrap();
 }

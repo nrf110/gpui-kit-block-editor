@@ -177,7 +177,9 @@ struct SectionView {
 
 struct Completion {
     section: SectionId,
-    range: CapturedRange,
+    // Button-opened menus have no slash text to remove.
+    range: Option<CapturedRange>,
+    anchor_to_button: bool,
     query: String,
     commands: Vec<SlashCommand>,
     selected: usize,
@@ -1395,6 +1397,32 @@ impl BlockEditor {
         cx.notify();
     }
 
+    fn open_command_menu(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.views.get_mut(id) else {
+            return;
+        };
+        view.show_source = true;
+        view.editor.update(cx, |state, cx| state.focus(window, cx));
+        if !self
+            .completion
+            .as_ref()
+            .is_some_and(|menu| menu.section == id)
+        {
+            self.completion = Some(Completion {
+                section: id.to_owned(),
+                range: None,
+                anchor_to_button: true,
+                query: String::new(),
+                commands: self.extensions.commands.search(""),
+                selected: 0,
+                scroll: ScrollHandle::new(),
+            });
+        } else if let Some(menu) = &mut self.completion {
+            menu.anchor_to_button = true;
+        }
+        cx.notify();
+    }
+
     fn update_completion(
         &mut self,
         id: &str,
@@ -1430,7 +1458,8 @@ impl BlockEditor {
                 .map_or_else(ScrollHandle::new, |c| c.scroll.clone());
             Completion {
                 section: id.to_owned(),
-                range,
+                range: Some(range),
+                anchor_to_button: false,
                 query,
                 selected: selected.min(commands.len().saturating_sub(1)),
                 commands,
@@ -1464,9 +1493,11 @@ impl BlockEditor {
         self.document.begin_history_group();
         let result = (|| -> anyhow::Result<()> {
             let native = editor.update(cx, |state, cx| -> anyhow::Result<()> {
-                state
-                    .replace_captured(&mut completion.range, "", cx)
-                    .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                if let Some(range) = &mut completion.range {
+                    state
+                        .replace_captured(range, "", cx)
+                        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                }
                 if let CommandAction::Editor(command) = &command.action {
                     if !structural {
                         state
@@ -1531,7 +1562,7 @@ impl BlockEditor {
         cx.notify();
     }
 
-    fn menu(&self, id: &str, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn menu(&self, id: &str, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let completion = self.completion.as_ref().filter(|c| c.section == id)?;
         let selected = completion.selected;
         let mut items = div()
@@ -1548,6 +1579,11 @@ impl BlockEditor {
             .id("slash-menu")
             .w_full()
             .max_w(px(420.))
+            .when(completion.anchor_to_button, |menu| {
+                menu.w(px(420.).min((window.viewport_size().width - px(16.)).max(px(0.))))
+            })
+            .occlude()
+            .on_scroll(|_, _, cx| cx.stop_propagation())
             .p_2()
             .rounded_lg()
             .border_1()
@@ -1563,7 +1599,11 @@ impl BlockEditor {
                     .py_1()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child("Scroll to browse · Type to filter · ↑ ↓ · Enter · Esc"),
+                    .child(if completion.range.is_some() {
+                        "Scroll to browse · Type to filter · ↑ ↓ · Enter · Esc"
+                    } else {
+                        "Scroll to browse · Type / to filter · ↑ ↓ · Enter · Esc"
+                    }),
             );
         if completion.commands.is_empty() {
             items = items.child(div().p_2().child("No matching commands"));
@@ -1602,6 +1642,11 @@ impl BlockEditor {
         let items = {
             use gpui_kit::test::TestSupportExt;
             items.test_support()
+        };
+        #[cfg(test)]
+        let menu = {
+            use gpui_kit::test::TestSupportExt;
+            menu.test_support()
         };
         Some(menu.child(items).into_any_element())
     }
@@ -1879,7 +1924,7 @@ impl BlockEditor {
 }
 
 impl Render for BlockEditor {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut content = div()
             .flex()
             .flex_col()
@@ -1907,10 +1952,20 @@ impl Render for BlockEditor {
             let drag_id = id.clone();
             let drag_owner = cx.weak_entity();
             let remove_id = id.clone();
+            let command_id = id.clone();
             let menu = if show_source {
-                self.menu(&id, cx)
+                self.menu(&id, window, cx)
             } else {
                 None
+            };
+            let (button_menu, menu) = if self
+                .completion
+                .as_ref()
+                .is_some_and(|menu| menu.section == id && menu.anchor_to_button)
+            {
+                (menu, None)
+            } else {
+                (None, menu)
             };
             if let Some(groups) = self.list_starts.get(&id) {
                 for group in groups {
@@ -2036,6 +2091,55 @@ impl Render for BlockEditor {
                         before: Some(id.clone()),
                     },
                     cx,
+                )
+                .child(
+                    div()
+                        .relative()
+                        .self_center()
+                        .w(px(24.))
+                        .h(px(28.))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+                        .child(
+                            div()
+                                .invisible()
+                                .group_hover("block-section", |style| style.visible())
+                                .child(
+                                    Button::new(("block-menu", index))
+                                        .ghost()
+                                        .small()
+                                        .icon(IconName::Plus)
+                                        .accessibility_label("Open block commands")
+                                        .tooltip("Open block commands")
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.open_command_menu(&command_id, window, cx);
+                                        })),
+                                ),
+                        )
+                        .when_some(button_menu, |el, menu| {
+                            el.child(
+                                div().absolute().top_0().left_0().child(
+                                    deferred(
+                                        anchored()
+                                            .anchor(Anchor::TopLeft)
+                                            .position_mode(AnchoredPositionMode::Local)
+                                            .attach(
+                                                Bounds::new(
+                                                    point(px(0.), px(0.)),
+                                                    size(px(24.), px(28.)),
+                                                ),
+                                                Anchor::BottomLeft,
+                                            )
+                                            .offset(point(px(0.), px(4.)))
+                                            .child(menu),
+                                    )
+                                    .with_priority(1),
+                                ),
+                            )
+                        }),
                 )
                 .child(grip)
                 .when(collapsible, |row| {
