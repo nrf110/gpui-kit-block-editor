@@ -43,6 +43,9 @@ impl BlockEditorState {
         let frame = self.frame.borrow();
         let mut out = Vec::new();
         for g in &frame.grids {
+            if g.cols.is_empty() || g.rows.is_empty() {
+                continue;
+            }
             let b = g.bounds;
             let reach = px(REACH);
             if at.x < b.left() - reach
@@ -73,8 +76,17 @@ impl BlockEditorState {
                 .rows
                 .iter()
                 .position(|(t, bt)| y >= *t && y < *bt)
-                .or_else(|| (y >= b.bottom() - px(2.)).then(|| g.rows.len() - 1))
-                .or_else(|| (y < g.rows[0].0).then_some(0));
+                .or_else(|| {
+                    if y >= b.bottom() - px(2.) {
+                        g.rows.iter().rposition(|(t, bt)| bt > t)
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| {
+                    let first = g.rows.iter().position(|(t, bt)| bt > t)?;
+                    (y < g.rows[first].0).then_some(first)
+                });
             if let Some(r) = row {
                 let (t, bt) = g.rows[r];
                 let h = px(16.).min(bt - t);

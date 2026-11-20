@@ -504,13 +504,17 @@ impl BlockEditor {
             view.show_source = true;
             view.editor.update(cx, |state, cx| -> anyhow::Result<()> {
                 let document = state.model().document();
-                let position = if at_end {
-                    document.last_caret()
+                let selection = if document.leaves().next().is_some() {
+                    BlockSelection::caret(if at_end {
+                        document.last_caret()
+                    } else {
+                        document.first_caret()
+                    })
                 } else {
-                    document.first_caret()
+                    state.selection().clone()
                 };
                 state
-                    .set_selection(BlockSelection::caret(position), cx)
+                    .set_selection(selection, cx)
                     .map_err(|error| anyhow::anyhow!("{error:?}"))?;
                 state.focus(window, cx);
                 Ok(())
@@ -599,14 +603,16 @@ impl BlockEditor {
         let position = point
             .as_ref()
             .and_then(|point| map.position(point, Assoc::After))
-            .or_else(|| map.first_position())
-            .context("new block has no editable caret")?;
+            .or_else(|| map.first_position());
         if view.previewable {
             view.show_source = true;
         }
         view.editor.update(cx, |state, cx| -> anyhow::Result<()> {
+            let selection = position
+                .map(BlockSelection::caret)
+                .unwrap_or_else(|| state.selection().clone());
             state
-                .set_selection(BlockSelection::caret(position), cx)
+                .set_selection(selection, cx)
                 .map_err(|error| anyhow::anyhow!("{error:?}"))?;
             state.focus(window, cx);
             Ok(())
@@ -2496,3 +2502,7 @@ mod collapsible_tests;
 #[cfg(test)]
 #[path = "selection_toolbar_tests.rs"]
 mod selection_toolbar_tests;
+
+#[cfg(test)]
+#[path = "merge_editor_tests.rs"]
+mod merge_editor_tests;

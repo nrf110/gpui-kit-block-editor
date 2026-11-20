@@ -473,11 +473,11 @@ impl FrameLayout {
                 }
             }
             let pad_y = px(CELL_PAD_Y);
-            let row_spans: Vec<(Pixels, Pixels)> = shape
+            let row_spans: Vec<Option<(Pixels, Pixels)>> = shape
                 .grid
                 .iter()
                 .enumerate()
-                .filter_map(|(r, row)| {
+                .map(|(r, row)| {
                     let bounds: Vec<Bounds<Pixels>> = row
                         .iter()
                         .filter_map(|c| self.leaf(*c).map(|l| l.bounds()))
@@ -491,23 +491,40 @@ impl FrameLayout {
                     ))
                 })
                 .collect();
-            if row_spans.len() != shape.grid.len() {
+            if shape
+                .grid
+                .iter()
+                .zip(&row_spans)
+                .any(|(row, span)| !row.is_empty() && span.is_none())
+            {
                 continue;
             }
             for (r, row) in shape.grid.iter().enumerate() {
                 for (c, cell) in row.iter().enumerate() {
                     let (l, rt) = col_spans[c];
-                    let (t, b) = row_spans[r];
+                    let Some((t, b)) = row_spans[r] else {
+                        continue;
+                    };
                     self.cell_boxes
                         .insert(*cell, Bounds::from_corners(point(l, t), point(rt, b)));
                 }
             }
             let (l, r) = (col_spans[0].0, col_spans[cols - 1].1);
-            let (t, b) = (row_spans[0].0, row_spans[row_spans.len() - 1].1);
+            let Some((t, b)) = row_spans
+                .iter()
+                .flatten()
+                .copied()
+                .reduce(|(top, _), (_, bottom)| (top, bottom))
+            else {
+                continue;
+            };
             self.grids.push(TableGeom {
                 table: shape.table,
                 cols: col_spans,
-                rows: row_spans,
+                rows: row_spans
+                    .into_iter()
+                    .map(|span| span.unwrap_or((t, t)))
+                    .collect(),
                 bounds: Bounds::from_corners(point(l - rule, t - rule), point(r + rule, b + rule)),
             });
         }

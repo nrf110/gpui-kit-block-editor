@@ -109,6 +109,13 @@ pub enum RichLength {
     Relative(f32),
 }
 
+impl RichRun {
+    /// Validate mark and atom encoding independently of a containing node kind.
+    pub fn validate(&self) -> Result<(), gpui::SharedString> {
+        crate::rich_bridge::validate_run(self)
+    }
+}
+
 impl RichDocument {
     pub fn paragraph(text: &str) -> Self {
         Self {

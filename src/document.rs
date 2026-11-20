@@ -1018,7 +1018,11 @@ impl Document {
             let mut ancestor = Some(section.id.as_str());
             while let Some(id) = ancestor {
                 ensure!(visited.insert(id), "section parent cycle");
-                ancestor = known[id].parent.as_deref();
+                ancestor = known
+                    .get(id)
+                    .ok_or_else(|| anyhow!("missing section parent"))?
+                    .parent
+                    .as_deref();
             }
         }
         let mut document = Self::new();
@@ -2048,6 +2052,22 @@ fn edit_text(document: &mut Document, id: &str, text: &str) -> Result<()> {
     };
     document.set_content(id, &content)
 }
+
+#[cfg(test)]
+#[path = "atom_storage_tests.rs"]
+mod atom_storage_tests;
+
+#[cfg(test)]
+#[path = "concurrent_code_tests.rs"]
+mod concurrent_code_tests;
+
+#[cfg(test)]
+#[path = "concurrent_table_tests.rs"]
+mod concurrent_table_tests;
+
+#[cfg(test)]
+#[path = "json_ancestor_tests.rs"]
+mod json_ancestor_tests;
 
 #[cfg(test)]
 #[path = "nested_document_tests.rs"]

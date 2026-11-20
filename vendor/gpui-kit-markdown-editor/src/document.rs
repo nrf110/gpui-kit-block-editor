@@ -317,7 +317,14 @@ impl EditorDocument {
                     if !entry.kind.is_container() {
                         return Err(format!("{:?} has children", entry.kind));
                     }
-                    if children.is_empty() && entry.kind != BlockKindData::Root {
+                    if children.is_empty()
+                        && !matches!(
+                            entry.kind,
+                            BlockKindData::Root
+                                | BlockKindData::Table { .. }
+                                | BlockKindData::TableRow
+                        )
+                    {
                         return Err(format!("empty container {:?}", entry.kind));
                     }
                     if let BlockKindData::List { .. } = entry.kind
@@ -343,7 +350,12 @@ impl EditorDocument {
         if seen != self.blocks.len() {
             return Err("orphaned entries".into());
         }
-        if self.walk_leaves().is_empty() {
+        if self.walk_leaves().is_empty()
+            && !self
+                .blocks
+                .values()
+                .any(|entry| matches!(entry.kind, BlockKindData::Table { .. }))
+        {
             return Err("no caret leaf".into());
         }
         Ok(())

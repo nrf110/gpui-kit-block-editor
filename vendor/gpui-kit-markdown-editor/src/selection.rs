@@ -122,19 +122,29 @@ impl EditorDocument {
         }
     }
 
-    pub(crate) fn first_leaf_in(&self, id: BlockId) -> BlockPosition {
-        let mut current = id;
-        while let Some(first) = self.children(current).first() {
-            current = *first;
+    fn edge_leaf(&self, id: BlockId, end: bool) -> Option<BlockId> {
+        if self.is_caret_leaf(id) {
+            return Some(id);
         }
-        BlockPosition::new(current, 0)
+        let children = self.children(id);
+        if end {
+            children
+                .iter()
+                .rev()
+                .find_map(|child| self.edge_leaf(*child, end))
+        } else {
+            children
+                .iter()
+                .find_map(|child| self.edge_leaf(*child, end))
+        }
+    }
+
+    pub(crate) fn first_leaf_in(&self, id: BlockId) -> BlockPosition {
+        BlockPosition::new(self.edge_leaf(id, false).unwrap_or(id), 0)
     }
 
     pub(crate) fn last_leaf_in(&self, id: BlockId) -> BlockPosition {
-        let mut current = id;
-        while let Some(last) = self.children(current).last() {
-            current = *last;
-        }
-        BlockPosition::new(current, self.leaf_len(current).unwrap_or(0))
+        let leaf = self.edge_leaf(id, true).unwrap_or(id);
+        BlockPosition::new(leaf, self.leaf_len(leaf).unwrap_or(0))
     }
 }

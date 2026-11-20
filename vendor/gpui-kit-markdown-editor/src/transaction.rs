@@ -261,7 +261,12 @@ impl<'a> TransactionBuilder<'a> {
         while let Some(id) = stack.pop() {
             let entry = doc.get(id)?;
             if let BlockContent::Children(children) = &entry.content {
-                if children.is_empty() && entry.kind != BlockKindData::Root {
+                if children.is_empty()
+                    && !matches!(
+                        entry.kind,
+                        BlockKindData::Root | BlockKindData::Table { .. } | BlockKindData::TableRow
+                    )
+                {
                     return Some(Fix::RemoveEmpty(id));
                 }
                 if let BlockKindData::List { .. } = entry.kind
@@ -289,7 +294,12 @@ impl<'a> TransactionBuilder<'a> {
                 stack.extend(children.iter().copied());
             }
         }
-        if doc.walk_leaves().is_empty() {
+        if doc.walk_leaves().is_empty()
+            && !doc
+                .blocks
+                .values()
+                .any(|entry| matches!(entry.kind, BlockKindData::Table { .. }))
+        {
             return Some(Fix::NoLeaf);
         }
         None

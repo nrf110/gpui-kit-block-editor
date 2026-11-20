@@ -67,6 +67,19 @@ fn aligns(doc: &EditorDocument, table: BlockId) -> Vec<ColumnAlign> {
     }
 }
 
+/// Find an actual cell near a requested slot, skipping concurrently emptied rows.
+fn cell_near(doc: &EditorDocument, table: BlockId, row: usize, col: usize) -> Option<BlockId> {
+    let rows = doc.children(table);
+    let at = row.min(rows.len());
+    rows[at..]
+        .iter()
+        .chain(rows[..at].iter().rev())
+        .find_map(|row| {
+            let cells = doc.children(*row);
+            cells.get(col.min(cells.len().saturating_sub(1))).copied()
+        })
+}
+
 /// Which table edit to make at the caret's cell, or across the rows and
 /// columns of a cell selection (D20).
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -131,7 +144,7 @@ impl BlockEditorModel {
         let Some(cells) = self.selected_cells() else {
             return Ok(false);
         };
-        let first = cells.first().and_then(|r| r.first()).copied();
+        let first = cells.iter().flatten().next().copied();
         self.transact(origin, |tx| {
             for cell in cells.iter().flatten() {
                 let len = tx.doc.leaf_len(*cell).unwrap_or(0);
@@ -156,11 +169,13 @@ impl BlockEditorModel {
             super::serialize::inline_markdown(&inline)
         };
         let mut out = String::new();
+        let width = cells.iter().map(Vec::len).max().unwrap_or(0);
         for (r, row) in cells.iter().enumerate() {
-            let line: Vec<String> = row.iter().map(cell_text).collect();
+            let mut line: Vec<String> = row.iter().map(cell_text).collect();
+            line.resize(width, String::new());
             out.push_str(&format!("| {} |\n", line.join(" | ")));
             if r == 0 {
-                let sep: Vec<&str> = row.iter().map(|_| "---").collect();
+                let sep: Vec<&str> = (0..width).map(|_| "---").collect();
                 out.push_str(&format!("| {} |\n", sep.join(" | ")));
             }
         }
@@ -186,10 +201,11 @@ impl BlockEditorModel {
         } else if let Some(next) = cells.get(ix + 1) {
             *next
         } else {
-            let cols = self
-                .doc
-                .children(*self.doc.children(table).last().unwrap_or(&table))
-                .len();
+            let cols = grid(&self.doc, table)
+                .iter()
+                .map(Vec::len)
+                .max()
+                .unwrap_or(0);
             let row = empty_row(cols.max(1));
             let first = match &row.content {
                 super::step::DetachedContent::Children(c) => c[0].id,
@@ -307,8 +323,8 @@ impl BlockEditorModel {
             }
             TableLine::Column(c) => {
                 let (Some(a), Some(h)) = (
-                    grid.first().and_then(|r| r.get(c)),
-                    grid.last().and_then(|r| r.get(c)),
+                    grid.iter().find_map(|r| r.get(c)),
+                    grid.iter().rev().find_map(|r| r.get(c)),
                 ) else {
                     return Ok(false);
                 };
@@ -323,13 +339,30 @@ impl BlockEditorModel {
     /// or across the cell selection (one undo step). Removing every row or
     /// every column removes the table.
     pub(crate) fn edit_table(&mut self, edit: TableEdit) -> Result<bool, CommandError> {
-        let Some((table, rsel, csel)) = self.table_span() else {
+        let span = self.table_span().or_else(|| {
+            let BlockSelection::Blocks { anchor, head } = self.selection() else {
+                return None;
+            };
+            if anchor != head || !matches!(self.doc.kind(*head), Some(BlockKindData::Table { .. }))
+            {
+                return None;
+            }
+            let grid = grid(&self.doc, *head);
+            if grid.iter().any(|row| !row.is_empty()) {
+                return None;
+            }
+            Some((*head, 0..=grid.len().saturating_sub(1), 0..=0))
+        });
+        let Some((table, rsel, csel)) = span else {
             return Err(CommandError::Unsupported("caret is not in a table"));
         };
         let (r0, r1, c0, c1) = (*rsel.start(), *rsel.end(), *csel.start(), *csel.end());
         let grid = grid(&self.doc, table);
         let rows = grid.len();
         let cols = grid.iter().map(Vec::len).max().unwrap_or(0);
+        if cols == 0 && matches!(edit, TableEdit::SetColumnAlign(_)) {
+            return Ok(false);
+        }
         let row_ids = self.doc.children(table).to_vec();
         let mut aligns = aligns(&self.doc, table);
         aligns.resize(cols, ColumnAlign::default());
@@ -342,33 +375,23 @@ impl BlockEditorModel {
             })?;
             return self.run(super::command::EditorCommand::DeleteSelection);
         }
-        let r = r0;
-        let c = c0;
-        let cell_at = |row: usize, col: usize| -> BlockId {
-            let row = &grid[row.min(rows - 1)];
-            row[col.min(row.len().saturating_sub(1))]
-        };
         self.transact(EditOrigin::Command("table_edit"), |tx| {
             let caret_cell = match edit {
                 TableEdit::AddRowAbove | TableEdit::AddRowBelow => {
                     let at = if edit == TableEdit::AddRowBelow {
-                        r1 + 1
+                        (r1 + 1).min(rows)
                     } else {
                         r0
                     };
-                    let row = empty_row(cols);
+                    let row = empty_row(cols.max(1));
                     let mut ids = Vec::new();
                     row.ids(&mut ids);
                     tx.insert(table, at, vec![row])?;
-                    ids[1 + c.min(cols - 1)]
+                    Some(ids[1 + c0.min(cols.max(1) - 1)])
                 }
                 TableEdit::RemoveRow => {
                     tx.remove(table, r0..r1 + 1)?;
-                    if r1 + 1 < rows {
-                        cell_at(r1 + 1, c)
-                    } else {
-                        cell_at(r0 - 1, c)
-                    }
+                    cell_near(tx.doc, table, r0, c0)
                 }
                 TableEdit::AddColumnLeft | TableEdit::AddColumnRight => {
                     let at = if edit == TableEdit::AddColumnRight {
@@ -376,11 +399,18 @@ impl BlockEditorModel {
                     } else {
                         c0
                     };
-                    let mut caret_cell = cell_at(r, c);
+                    let mut caret_cell = None;
+                    if row_ids.is_empty() {
+                        let row = empty_row(1);
+                        let mut ids = Vec::new();
+                        row.ids(&mut ids);
+                        caret_cell = Some(ids[1]);
+                        tx.insert(table, 0, vec![row])?;
+                    }
                     for (ri, row) in row_ids.iter().enumerate() {
                         let new = empty_cell();
-                        if ri == r {
-                            caret_cell = new.id;
+                        if ri == r0 {
+                            caret_cell = Some(new.id);
                         }
                         let at = at.min(tx.doc.children(*row).len());
                         tx.insert(*row, at, vec![new])?;
@@ -408,11 +438,7 @@ impl BlockEditorModel {
                             aligns: aligns.clone(),
                         },
                     )?;
-                    if c1 + 1 < cols {
-                        cell_at(r, c1 + 1)
-                    } else {
-                        cell_at(r, c0 - 1)
-                    }
+                    cell_near(tx.doc, table, r0, c0)
                 }
                 TableEdit::SetColumnAlign(align) => {
                     for a in &mut aligns[c0..=c1.min(cols - 1)] {
@@ -428,9 +454,13 @@ impl BlockEditorModel {
                     return Ok(None);
                 }
             };
-            Ok(Some(BlockSelection::caret(BlockPosition::new(
-                caret_cell, 0,
-            ))))
+            Ok(Some(match caret_cell {
+                Some(cell) => BlockSelection::caret(BlockPosition::new(cell, 0)),
+                None => BlockSelection::Blocks {
+                    anchor: table,
+                    head: table,
+                },
+            }))
         })?;
         Ok(true)
     }
@@ -466,7 +496,8 @@ impl BlockEditorModel {
             })?;
             return Ok(true);
         }
-        if r + 1 == grid.len() {
+        let next = grid[r + 1..].iter().find(|row| !row.is_empty());
+        if next.is_none() {
             let cols = grid.iter().map(Vec::len).max().unwrap_or(1).max(1);
             let row = empty_row(cols);
             let mut ids = Vec::new();
@@ -479,8 +510,8 @@ impl BlockEditorModel {
             })?;
             return Ok(true);
         }
-        let next = &grid[r + 1];
-        let target = next[c.min(next.len().saturating_sub(1))];
+        let next = next.unwrap();
+        let target = next[c.min(next.len() - 1)];
         self.set_selection(BlockSelection::caret(BlockPosition::new(target, 0)))?;
         Ok(true)
     }
@@ -544,7 +575,7 @@ impl BlockEditorModel {
     pub(crate) fn in_last_table_row(&self) -> bool {
         self.current_cell().is_some_and(|(table, cell)| {
             cell_coords(&self.doc, table, cell)
-                .is_some_and(|(r, _)| r + 1 == self.doc.children(table).len())
+                .is_some_and(|(r, _)| grid(&self.doc, table)[r + 1..].iter().all(Vec::is_empty))
         })
     }
 

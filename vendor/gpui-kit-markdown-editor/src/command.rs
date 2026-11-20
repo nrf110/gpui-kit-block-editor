@@ -1169,18 +1169,36 @@ impl BlockEditorModel {
         self.transact(EditOrigin::Command("delete_blocks"), |tx| {
             let start = range.start;
             tx.remove(parent, range)?;
-            let children = tx.doc.children(parent).to_vec();
-            let pos = if let Some(next) = children.get(start) {
-                tx.doc.first_leaf_in(*next)
-            } else if let Some(prev) = start.checked_sub(1).and_then(|i| children.get(i)) {
-                tx.doc.last_leaf_in(*prev)
+            let children = tx.doc.children(parent);
+            let target = children.get(start).map(|id| (*id, false)).or_else(|| {
+                start
+                    .checked_sub(1)
+                    .and_then(|index| children.get(index))
+                    .map(|id| (*id, true))
+            });
+            let selection = if let Some((block, end)) = target {
+                let pos = if end {
+                    tx.doc.last_leaf_in(block)
+                } else {
+                    tx.doc.first_leaf_in(block)
+                };
+                if tx.doc.is_caret_leaf(pos.block) {
+                    BlockSelection::caret(pos)
+                } else {
+                    // A surviving, concurrently emptied table is still a real
+                    // structural object, not a text caret or a repair paragraph.
+                    BlockSelection::Blocks {
+                        anchor: block,
+                        head: block,
+                    }
+                }
             } else {
                 let paragraph = DetachedBlock::paragraph(InlineText::new());
                 let id = paragraph.id;
                 tx.insert(parent, start, vec![paragraph])?;
-                BlockPosition::new(id, 0)
+                BlockSelection::caret(BlockPosition::new(id, 0))
             };
-            Ok(caret(pos))
+            Ok(Some(selection))
         })
     }
 
@@ -1239,9 +1257,21 @@ impl BlockEditorModel {
     pub fn run(&mut self, command: EditorCommand) -> Result<bool, CommandError> {
         match command {
             EditorCommand::SelectAll => {
-                let selection = BlockSelection::Text {
-                    anchor: self.doc.first_caret(),
-                    head: self.doc.last_caret(),
+                let first = self.doc.first_caret();
+                let selection = if self.doc.is_caret_leaf(first.block) {
+                    BlockSelection::Text {
+                        anchor: first,
+                        head: self.doc.last_caret(),
+                    }
+                } else {
+                    let children = self.doc.children(self.doc.root);
+                    let (Some(anchor), Some(head)) = (children.first(), children.last()) else {
+                        return Ok(false);
+                    };
+                    BlockSelection::Blocks {
+                        anchor: *anchor,
+                        head: *head,
+                    }
                 };
                 self.set_selection(selection)?;
                 Ok(true)

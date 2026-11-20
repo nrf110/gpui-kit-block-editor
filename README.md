@@ -164,6 +164,14 @@ Parent/rank is one atomic register; concurrent moves resolve through Y.Map confl
 
 Client ID zero is reserved for the common schema seed. Every collaborating implementation must use the same schema/bootstrap, not merely understand Yjs updates.
 
+### Concurrent semantic edits
+
+Code blocks project as plain text even when a peer concurrently adds inline formatting or atoms. Reading or receiving that state does not rewrite the attributed Y.Text; undoing the code conversion can reveal the peer's formatting and atom payloads again. Mark values and atom payloads are validated before projection. Adjacent identical atoms remain separate rich runs even when Yjs coalesces their attributed spans.
+
+Concurrent table row/column edits can leave ragged or empty grids. Every surviving cell and its ID is retained; native rendering/navigation handle missing slots, and Markdown export pads them without truncating wider rows. Alignment presentation follows the visible width. No synthetic collaborative cells or automatic repair transactions are created. A table without any text caret remains a selectable block: explicit row/column commands create real cells, and deleting the table restores an editable paragraph.
+
+Malformed semantic values and unsupported versions still reject before changing the live document. JSON imports validate ancestor chains with checked lookups, so missing ancestors and cycles return errors regardless of section order.
+
 ### Transport
 
 `state_vector()`, `encode_update(remote_state_vector)`, `encode_state()`, and `apply_update(bytes)` use raw **Yjs v1 binary encoding**. The binary encoding and document-format marker are independent versions, even though both currently equal 1. Duplicate/out-of-order updates are supported.

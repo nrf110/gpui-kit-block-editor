@@ -45,7 +45,8 @@ pub(crate) struct RichMap {
     nodes: Vec<Node>,
     native: HashMap<BlockId, usize>,
     stable: HashMap<Arc<str>, usize>,
-    first: BlockPosition,
+    first: Option<BlockPosition>,
+    fallback: BlockSelection,
 }
 
 impl RichMap {
@@ -54,7 +55,12 @@ impl RichMap {
             nodes: Vec::new(),
             native: HashMap::new(),
             stable: HashMap::new(),
-            first: model.document().first_caret(),
+            first: model
+                .document()
+                .leaves()
+                .next()
+                .map(|_| model.document().first_caret()),
+            fallback: model.selection().clone(),
         };
         for node in &content.blocks {
             map.add(node, None, None, model)?;
@@ -160,9 +166,19 @@ impl RichMap {
 
     pub(crate) fn position(&self, point: &RichPoint, assoc: Assoc) -> Option<BlockPosition> {
         let Some(index) = self.stable.get(point.node.as_str()) else {
-            return Some(self.first);
+            return self.first;
         };
         let node = &self.nodes[*index];
+        if matches!(
+            node.kind,
+            RichKind::List
+                | RichKind::ListItem
+                | RichKind::Quote
+                | RichKind::Table
+                | RichKind::TableRow
+        ) {
+            return self.first;
+        }
         if node.atomic {
             return Some(BlockPosition {
                 block: node.native,
@@ -265,6 +281,9 @@ impl RichMap {
                 _ => {}
             }
         }
+        if self.first.is_none() {
+            return Some(self.fallback.clone());
+        }
         let reversed = match (anchor, head) {
             (Some(a), Some(b)) => {
                 (a, selection.anchor.offset, selection.anchor.after_atom)
@@ -296,7 +315,7 @@ impl RichMap {
     }
 
     pub(crate) fn first_position(&self) -> Option<BlockPosition> {
-        Some(self.first)
+        self.first
     }
 }
 

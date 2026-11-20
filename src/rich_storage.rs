@@ -109,37 +109,58 @@ fn run_attrs(run: &RichRun) -> Attrs {
 }
 
 fn read_runs<T: ReadTxn>(text: &TextRef, txn: &T) -> Result<Vec<RichRun>> {
-    text.diff(txn, |_| ())
-        .into_iter()
-        .map(|diff| {
-            let Out::Any(Any::String(value)) = diff.insert else {
-                bail!("semantic text contains a non-text embed")
-            };
-            let mut marks = serde_json::to_value(RichMarks::default())?;
-            let mut atom = None;
-            if let Some(attrs) = diff.attributes {
-                for (key, value) in *attrs {
-                    if value == Any::Null {
-                        continue;
-                    }
-                    if key.as_ref() == "atom" {
-                        atom = Some(serde_json::from_value(any_json(&value)?)?);
-                    } else {
-                        ensure!(
-                            marks.get(key.as_ref()).is_some(),
-                            "unknown text attribute {key}"
-                        );
-                        marks[key.as_ref()] = any_json(&value)?;
-                    }
+    let mut runs = Vec::new();
+    for diff in text.diff(txn, |_| ()) {
+        let Out::Any(Any::String(value)) = diff.insert else {
+            bail!("semantic text contains a non-text embed")
+        };
+        let mut marks = serde_json::to_value(RichMarks::default())?;
+        let mut atom: Option<markdown_editor::rich::RichAtom> = None;
+        if let Some(attrs) = diff.attributes {
+            for (key, value) in *attrs {
+                if value == Any::Null {
+                    continue;
+                }
+                if key.as_ref() == "atom" {
+                    atom = Some(serde_json::from_value(any_json(&value)?)?);
+                } else {
+                    ensure!(
+                        marks.get(key.as_ref()).is_some(),
+                        "unknown text attribute {key}"
+                    );
+                    marks[key.as_ref()] = any_json(&value)?;
                 }
             }
-            Ok(RichRun {
+        }
+        let marks: RichMarks = serde_json::from_value(marks)?;
+        if let Some(atom) = atom {
+            ensure!(
+                !value.is_empty() && value.chars().all(|ch| ch == '\u{FFFC}'),
+                "atom metadata requires object replacement characters"
+            );
+            // Y.Text coalesces equal attributes, not semantic atom boundaries.
+            // Clone only the additional atoms; move the decoded payload last.
+            for _ in 1..value.len() / '\u{FFFC}'.len_utf8() {
+                runs.push(RichRun {
+                    text: "\u{FFFC}".into(),
+                    marks: marks.clone(),
+                    atom: Some(atom.clone()),
+                });
+            }
+            runs.push(RichRun {
+                text: "\u{FFFC}".into(),
+                marks,
+                atom: Some(atom),
+            });
+        } else {
+            runs.push(RichRun {
                 text: value.to_string(),
-                marks: serde_json::from_value(marks)?,
-                atom,
-            })
-        })
-        .collect()
+                marks,
+                atom: None,
+            });
+        }
+    }
+    Ok(runs)
 }
 
 pub(super) fn read_content<T: ReadTxn>(body: &MapRef, txn: &T) -> Result<RichDocument> {
@@ -175,13 +196,36 @@ pub(super) fn read_content<T: ReadTxn>(body: &MapRef, txn: &T) -> Result<RichDoc
         let Some(Out::YText(text)) = map.get(txn, "text") else {
             bail!("node has no Y.Text")
         };
+        let mut runs = read_runs(&text, txn)?;
+        if kind == RichKind::CodeBlock && !runs.is_empty() {
+            // Kind and inline marks are independent CRDT registers. Code
+            // displays plain text; keep concurrent marks/atoms in shared
+            // storage so undoing the conversion can reveal them again.
+            let mut bytes = 0;
+            for run in &runs {
+                run.validate().map_err(|error| anyhow!("{error}"))?;
+                bytes += run.text.len();
+            }
+            let mut plain = std::mem::take(&mut runs[0].text);
+            plain.reserve(bytes - plain.len());
+            for run in &runs[1..] {
+                plain.push_str(&run.text);
+            }
+            runs.clear();
+            if !plain.is_empty() {
+                runs.push(RichRun {
+                    text: plain,
+                    ..RichRun::default()
+                });
+            }
+        }
         all.insert(
             id.to_owned(),
             RichNode {
                 id: id.to_owned(),
                 kind,
                 attrs: values,
-                runs: read_runs(&text, txn)?,
+                runs,
                 children: vec![],
             },
         );

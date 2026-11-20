@@ -324,6 +324,39 @@ fn known_attrs(kind: RichKind) -> &'static [&'static str] {
     }
 }
 
+pub(crate) fn validate_run(run: &RichRun) -> Result<()> {
+    if let Some(color) = run.marks.highlight {
+        if color
+            .iter()
+            .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
+        {
+            return Err(error(
+                "highlight HSLA components must be finite values in 0..=1",
+            ));
+        }
+    }
+    if let Some(atom) = &run.atom {
+        if run.text != "\u{FFFC}" {
+            return Err(error("atom run must contain exactly U+FFFC"));
+        }
+        match atom {
+            RichAtom::Image { width, height, .. } => {
+                for length in [width, height].into_iter().flatten() {
+                    let (RichLength::Pixels(v) | RichLength::Rems(v) | RichLength::Relative(v)) =
+                        length;
+                    if !v.is_finite() || *v < 0.0 {
+                        return Err(error("image dimensions must be finite and nonnegative"));
+                    }
+                }
+            }
+            RichAtom::Custom { .. } => {
+                import_custom(atom)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate(document: &RichDocument) -> Result<()> {
     if document.version != RICH_DOCUMENT_VERSION {
         return Err(error(format!(
@@ -349,7 +382,12 @@ pub(crate) fn validate(document: &RichDocument) -> Result<()> {
             if !n.runs.is_empty() {
                 return Err(error("container cannot hold inline runs"));
             }
-            if n.children.is_empty() && !matches!(n.kind, RichKind::List | RichKind::Quote) {
+            if n.children.is_empty()
+                && !matches!(
+                    n.kind,
+                    RichKind::List | RichKind::Quote | RichKind::Table | RichKind::TableRow
+                )
+            {
                 return Err(error("empty rich container"));
             }
             if n.kind == RichKind::List && n.children.iter().any(|c| c.kind != RichKind::ListItem) {
@@ -378,53 +416,12 @@ pub(crate) fn validate(document: &RichDocument) -> Result<()> {
             {
                 return Err(error("list item must start with a leaf"));
             }
-            if n.kind == RichKind::Table {
-                let columns = n.children.first().map_or(0, |row| row.children.len());
-                if n.children.iter().any(|row| row.children.len() != columns) {
-                    return Err(error("table rows must have equal widths"));
-                }
-                if let BlockKindData::Table { aligns } = &native {
-                    if !aligns.is_empty() && aligns.len() != columns {
-                        return Err(error("table alignment count differs from column count"));
-                    }
-                }
-            }
         } else if !n.children.is_empty() {
             return Err(error("leaf cannot hold children"));
         }
         for run in &n.runs {
-            if let Some(color) = run.marks.highlight {
-                if color
-                    .iter()
-                    .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
-                {
-                    return Err(error(
-                        "highlight HSLA components must be finite values in 0..=1",
-                    ));
-                }
-            }
-            if let Some(atom) = &run.atom {
-                if run.text != "\u{FFFC}" {
-                    return Err(error("atom run must contain exactly U+FFFC"));
-                }
-                match atom {
-                    RichAtom::Image { width, height, .. } => {
-                        for length in [width, height].into_iter().flatten() {
-                            let (RichLength::Pixels(v)
-                            | RichLength::Rems(v)
-                            | RichLength::Relative(v)) = length;
-                            if !v.is_finite() || *v < 0.0 {
-                                return Err(error(
-                                    "image dimensions must be finite and nonnegative",
-                                ));
-                            }
-                        }
-                    }
-                    RichAtom::Custom { .. } => {
-                        import_custom(atom)?;
-                    }
-                }
-            } else if run.text.contains(ATOM_CHAR) && n.kind != RichKind::CodeBlock {
+            validate_run(run)?;
+            if run.atom.is_none() && run.text.contains(ATOM_CHAR) && n.kind != RichKind::CodeBlock {
                 return Err(error("U+FFFC requires atom metadata"));
             }
             match n.kind {
@@ -477,7 +474,7 @@ fn import_document(
     ) -> Result<DetachedBlock> {
         let native = kind(n)?;
         let mut detached = if native.is_container() {
-            if n.children.is_empty() {
+            if n.children.is_empty() && !matches!(n.kind, RichKind::Table | RichKind::TableRow) {
                 return Err(error(
                     "empty section metadata container cannot be mounted in a native editor",
                 ));
@@ -535,6 +532,13 @@ impl BlockEditorModel {
         let mut model = Self::from_document(doc);
         model.rich_ids = std::cell::RefCell::new(ids);
         model.rich_attrs = attrs;
+        if model.doc.walk_leaves().is_empty() {
+            let block = model.doc.children(model.doc.root)[0];
+            model.selection = BlockSelection::Blocks {
+                anchor: block,
+                head: block,
+            };
+        }
         Ok(model)
     }
 
@@ -551,7 +555,15 @@ impl BlockEditorModel {
         self.doc = doc;
         self.rich_ids = std::cell::RefCell::new(ids);
         self.rich_attrs = attrs;
-        self.selection = BlockSelection::caret(self.doc.first_caret());
+        self.selection = if self.doc.walk_leaves().is_empty() {
+            let block = self.doc.children(self.doc.root)[0];
+            BlockSelection::Blocks {
+                anchor: block,
+                head: block,
+            }
+        } else {
+            BlockSelection::caret(self.doc.first_caret())
+        };
         self.selection_epoch += 1;
         self.stored_marks = None;
         self.history.clear();

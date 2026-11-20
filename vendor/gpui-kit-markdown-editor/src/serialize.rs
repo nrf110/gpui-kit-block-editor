@@ -114,8 +114,18 @@ fn block(doc: &EditorDocument, id: BlockId) -> String {
         }
         (BlockKindData::Table { aligns }, _) => {
             let mut lines = Vec::new();
+            // Markdown fixes the width at the header. Pad presentation only,
+            // otherwise cells beyond a shorter header disappear on reimport.
+            let width = children
+                .iter()
+                .map(|row| doc.children(*row).len())
+                .max()
+                .unwrap_or(0);
+            if width == 0 {
+                return String::new();
+            }
             for (row_ix, row) in children.iter().enumerate() {
-                let cells: Vec<String> = doc
+                let mut cells: Vec<String> = doc
                     .children(*row)
                     .iter()
                     .map(|cell| match doc.inline(*cell) {
@@ -128,7 +138,7 @@ fn block(doc: &EditorDocument, id: BlockId) -> String {
                         None => String::new(),
                     })
                     .collect();
-                let width = cells.len();
+                cells.resize(width, String::new());
                 lines.push(format!("| {} |", cells.join(" | ")));
                 if row_ix == 0 {
                     let delimiters: Vec<&str> = (0..width)

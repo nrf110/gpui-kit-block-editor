@@ -179,13 +179,17 @@ impl NodeCache {
                     .with_leaf_key(id.as_u64());
                 BlockNode::CodeBlock(code)
             }
-            BlockKindData::Table { aligns } => BlockNode::Table(Table::new(
-                doc.children(id)
+            BlockKindData::Table { aligns } => {
+                let rows: Vec<_> = doc
+                    .children(id)
                     .iter()
                     .map(|row| self.row(doc, *row))
-                    .collect(),
-                aligns.clone(),
-            )),
+                    .collect();
+                let width = rows.iter().map(Vec::len).max().unwrap_or(0);
+                let mut aligns = aligns.clone();
+                aligns.resize(width, Default::default());
+                BlockNode::Table(Table::new(rows, aligns))
+            }
             BlockKindData::TableRow | BlockKindData::TableCell => return None,
             BlockKindData::HorizontalRule => BlockNode::HorizontalRule { span: None },
             BlockKindData::Break { html } => BlockNode::Break {
