@@ -289,6 +289,17 @@ impl RenderOnce for BlockEditor {
                     }
                     _ => node.render(node_ix, flow.last(is_last_node), &node_cx, window, cx),
                 };
+                // Keep the edge controls inside the editor's hitbox and
+                // scroll viewport, including tables at the document origin.
+                let element = if matches!(node, BlockNode::Table(_)) {
+                    div()
+                        .pl(px(super::table_ui::TABLE_CONTROL_GUTTER))
+                        .pt(px(super::table_ui::TABLE_CONTROL_GUTTER))
+                        .child(element)
+                        .into_any_element()
+                } else {
+                    element
+                };
                 // Per-block accessibility node around the rendered block.
                 let element = match block_role(node) {
                     Some((role, level)) => div()
@@ -331,13 +342,22 @@ impl RenderOnce for BlockEditor {
             })
             .key_context(self.state.read(cx).key_context())
             .track_focus(&focus)
-            .cursor(if self.state.read(cx).grip_hover {
-                CursorStyle::OpenHand
-            } else if self.state.read(cx).pointer_hand {
-                CursorStyle::PointingHand
-            } else {
-                CursorStyle::IBeam
-            })
+            .cursor(
+                if self
+                    .state
+                    .read(cx)
+                    .table_grip_hit(window.mouse_position())
+                    .is_some()
+                {
+                    CursorStyle::PointingHand
+                } else if self.state.read(cx).grip_hover {
+                    CursorStyle::OpenHand
+                } else if self.state.read(cx).pointer_hand {
+                    CursorStyle::PointingHand
+                } else {
+                    CursorStyle::IBeam
+                },
+            )
             .w_full()
             .on_action(window.listener_for(s, BlockEditorState::on_backspace))
             .on_action(window.listener_for(s, BlockEditorState::on_delete))
@@ -559,7 +579,7 @@ impl Element for EditorRoot {
                 // gpui-kit's cell padding is `px_3`: 0.75rem.
                 let pad = window.rem_size() * 0.75;
                 let right = frame.content.map(|c| c.right());
-                frame.layout_tables(&shapes, pad, right);
+                frame.layout_tables(&shapes, pad, right, window.scale_factor());
             }
             *self.state.read(cx).frame.borrow_mut() = frame;
             let mask = window.content_mask().bounds;
@@ -649,19 +669,9 @@ impl Element for EditorRoot {
         };
         // Node selection (a table, code block, …): the blocks' laid-out area.
         let selected_area = state.model.selected_blocks().and_then(|(parent, range)| {
-            let doc = &state.model.doc;
-            let ids = doc.children(parent).get(range)?.to_vec();
-            let frame = frame.borrow();
             frame
-                .leaves
-                .iter()
-                .filter(|leaf| {
-                    let path = doc.path(leaf.info.block);
-                    ids.iter()
-                        .any(|id| *id == leaf.info.block || path.contains(id))
-                })
-                .map(|leaf| leaf.bounds())
-                .reduce(|a, b| a.union(&b))
+                .borrow()
+                .selected_block_bounds(&state.model.doc, parent, range)
         });
 
         window.handle_input(
@@ -696,8 +706,8 @@ impl Element for EditorRoot {
             window.paint_quad(fill(grip, style.caret().opacity(0.35)).corner_radii(px(2.)));
         }
         // Whole-table handle: a small rounded square with a 2x2 grid glyph
-        // at the frame's outer top-left corner, distinct from the thin
-        // row / column grips.
+        // at the frame's outer top-left corner, distinct from the
+        // ellipsis row / column controls.
         for (handle, active) in table_handles {
             let alpha = if active { 0.9 } else { 0.45 };
             window.paint_quad(gpui::quad(
@@ -717,12 +727,35 @@ impl Element for EditorRoot {
                 ));
             }
         }
-        // Table grips (D20): only for the hovered column / row, or the
-        // line whose menu is open.
+        // Compact ellipsis controls, only on hover or while their menu is
+        // open. Their square targets remain clear of the corner handle.
         for (table, line, grip) in grips {
-            let open = menu_line == Some((table, line));
-            let alpha = if open { 0.8 } else { 0.35 };
-            window.paint_quad(fill(grip, style.caret().opacity(alpha)).corner_radii(px(2.)));
+            let active = menu_line == Some((table, line)) || grip.dilate(px(2.)).contains(&mouse);
+            window.paint_quad(gpui::quad(
+                grip,
+                px(4.),
+                style.selection().opacity(if active { 0.55 } else { 0.18 }),
+                px(1.),
+                style.caret().opacity(if active { 0.6 } else { 0.25 }),
+                gpui::BorderStyle::Solid,
+            ));
+            let center = grip.center();
+            for offset in [-4., 0., 4.] {
+                let (dx, dy) = match line {
+                    super::table::TableLine::Column(_) => (offset, 0.),
+                    super::table::TableLine::Row(_) => (0., offset),
+                };
+                window.paint_quad(
+                    fill(
+                        Bounds::new(
+                            point(center.x + px(dx) - px(1.), center.y + px(dy) - px(1.)),
+                            size(px(2.), px(2.)),
+                        ),
+                        style.caret().opacity(if active { 0.95 } else { 0.7 }),
+                    )
+                    .corner_radii(px(1.)),
+                );
+            }
         }
         if let Some(area) = selected_area {
             let area = area.dilate(px(4.));
@@ -766,6 +799,19 @@ impl Element for EditorRoot {
         let hitbox = prepaint.hitbox.clone();
         let entity = self.state.clone();
         window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+            if phase == DispatchPhase::Capture
+                && event.button == MouseButton::Left
+                && !hitbox.is_hovered(window)
+            {
+                // Blank space need not move focus, and other controls may
+                // stop bubbling. Dismiss before either can leave a stale
+                // table object selection behind; table menus use Cells.
+                let dismissed = entity.update(cx, |state, cx| state.dismiss_table_selection(cx));
+                if dismissed && entity.read(cx).focus_handle.is_focused(window) {
+                    window.blur(cx);
+                }
+                return;
+            }
             if phase != DispatchPhase::Bubble
                 || event.button != MouseButton::Left
                 || !hitbox.is_hovered(window)

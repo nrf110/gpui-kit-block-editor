@@ -47,6 +47,12 @@ Inline styles and links affect only the highlighted text. Heading and structural
 
 **Link** opens a padded editing row and focuses a URL field prefilled from the selection's existing link. **Apply** or **Enter** saves; **Cancel** or **Escape** discards the draft. **Remove link**, or applying an empty URL, unlinks the text. HTTP, HTTPS, mailto, relative, and fragment URLs are supported; unsafe schemes are rejected without changing the document. The target uses CRDT-relative positions, so peer edits during URL entry do not redirect the action to unrelated text. Toolbar actions participate in local collaborative undo.
 
+### Tables
+
+The hover-only corner grid handle selects the whole table; its highlight covers complete cells, including their padding and trailing column space. Clicking elsewhere deselects it without changing content or scrolling back to the table.
+
+Hover a row or column to reveal an ellipsis icon to its left or above it. Click to insert rows above/below, insert columns left/right, or delete that row/column. Column menus also offer alignment. Header-row deletion remains disabled. Escape or an outside click closes the menu, and wheel input over it does not scroll the document. Menu edits use the same shared storage and collaborative undo as keyboard/slash commands.
+
 ### Collapsible sections
 
 Type **/collapsible** and press **Enter**, or scroll the **/** menu and click **Collapsible section**. This converts the current block into an editable title and creates an editable child. An empty title becomes `Details`; existing content and descendants are retained. The creator's view expands immediately for editing.

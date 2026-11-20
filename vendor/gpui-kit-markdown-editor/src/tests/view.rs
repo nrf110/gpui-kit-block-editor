@@ -4604,3 +4604,9 @@ fn closing_first_rules_leave_literal_punctuation(cx: &mut TestAppContext) {
     type_chars(cx, "*");
     assert_eq!(source(&editor, cx), "`a *b*`", "inside inline code");
 }
+
+#[path = "table_selection.rs"]
+mod table_selection;
+
+#[path = "table_edge_menus.rs"]
+mod table_edge_menus;

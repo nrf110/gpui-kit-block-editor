@@ -2506,3 +2506,7 @@ mod selection_toolbar_tests;
 #[cfg(test)]
 #[path = "merge_editor_tests.rs"]
 mod merge_editor_tests;
+
+#[cfg(test)]
+#[path = "table_editor_tests.rs"]
+mod table_editor_tests;

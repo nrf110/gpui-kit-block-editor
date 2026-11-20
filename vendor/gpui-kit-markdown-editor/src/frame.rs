@@ -167,6 +167,38 @@ impl FrameLayout {
         self.index.get(&block).map(|ix| &self.leaves[*ix])
     }
 
+    /// Whole-block selection paint bounds, including table padding and slack.
+    pub(crate) fn selected_block_bounds(
+        &self,
+        doc: &EditorDocument,
+        parent: BlockId,
+        range: Range<usize>,
+    ) -> Option<Bounds<Pixels>> {
+        fn subtree_bounds(
+            frame: &FrameLayout,
+            doc: &EditorDocument,
+            block: BlockId,
+        ) -> Option<Bounds<Pixels>> {
+            if let Some(grid) = frame.grids.iter().find(|grid| grid.table == block) {
+                return Some(grid.bounds);
+            }
+            // Without a reconstructed grid, retain the laid-out descendant
+            // leaves as the fallback, just as for ordinary text containers.
+            frame.leaf(block).map(LeafGeom::bounds).or_else(|| {
+                doc.children(block)
+                    .iter()
+                    .filter_map(|child| subtree_bounds(frame, doc, *child))
+                    .reduce(|a, b| a.union(&b))
+            })
+        }
+
+        doc.children(parent)
+            .get(range)?
+            .iter()
+            .filter_map(|block| subtree_bounds(self, doc, *block))
+            .reduce(|a, b| a.union(&b))
+    }
+
     pub(crate) fn caret_bounds(&self, pos: BlockPosition, width: Pixels) -> Option<Bounds<Pixels>> {
         let leaf = self.leaf(pos.block)?;
         let (line, h) = (leaf.line_height(), leaf.caret_height());
@@ -368,6 +400,7 @@ pub(crate) struct TableShape {
 /// Cell box padding and rule widths of gpui-kit's table (`px_3`, `py(7)`,
 /// `border_r_1` between columns, `border_1` frame).
 const CELL_PAD_Y: f32 = 7.;
+const CELL_MIN_WIDTH: f32 = 48.;
 const RULE: f32 = 1.;
 
 impl FrameLayout {
@@ -379,17 +412,16 @@ impl FrameLayout {
     /// In a Left / None column the text element of every cell is the
     /// cell's content box. In a Centre / Right column (gpui-kit 0.10+) each
     /// text element shrinks to its text and is placed inside the content
-    /// box, so the column's widest text element stands for the box: it is
-    /// either at the column's natural width (which sizes the box) or wraps
-    /// and fills it. Its left edge plus the alignment's slack share gives
-    /// the column edge; the one unknown, slack per pixel of cell, comes
-    /// from the gaps between neighbouring cells. Also records each cell's
-    /// alignment.
+    /// box. Account for the renderer's 48px minimum (divider included),
+    /// device-pixel rounding, and any alignment space inside that box before
+    /// inferring the proportional slack between columns. Otherwise short
+    /// centred/right-aligned text gives incorrect column edges.
     pub(crate) fn layout_tables(
         &mut self,
         shapes: &[TableShape],
         pad_x: Pixels,
         content_right: Option<Pixels>,
+        scale_factor: f32,
     ) {
         self.grids.clear();
         self.cell_boxes.clear();
@@ -403,15 +435,20 @@ impl FrameLayout {
                 }
             }
             let cols = shape.grid.iter().map(Vec::len).max().unwrap_or(0);
-            // Each column's content box (left, width): its widest text
-            // element (see above).
-            let mut elems: Vec<Option<(Pixels, Pixels)>> = vec![None; cols];
+            // Widest text (left, width), padded cell width, and alignment
+            // space inside that cell. The renderer rounds up to device pixels.
+            let mut elems: Vec<Option<(Pixels, Pixels, Pixels, Pixels)>> = vec![None; cols];
             for row in &shape.grid {
                 for (c, cell) in row.iter().enumerate() {
                     if let Some(leaf) = self.leaf(*cell) {
                         let b = leaf.bounds();
-                        if elems[c].is_none_or(|(_, w)| b.size.width > w) {
-                            elems[c] = Some((b.left(), b.size.width));
+                        if elems[c].is_none_or(|(_, w, _, _)| b.size.width > w) {
+                            let divider = if c + 1 < cols { px(RULE) } else { px(0.) };
+                            let width =
+                                (b.size.width + pad_x * 2.).max(px(CELL_MIN_WIDTH) - divider);
+                            let width = px((f32::from(width) * scale_factor).ceil() / scale_factor);
+                            let inner = width - b.size.width - pad_x * 2.;
+                            elems[c] = Some((b.left(), b.size.width, width, inner));
                         }
                     }
                 }
@@ -427,12 +464,16 @@ impl FrameLayout {
                 ColumnAlign::Right => (1., 0.),
                 _ => (0., 1.),
             };
-            let cell_w = |c: usize| elems[c].1 + pad_x * 2.;
+            let cell_w = |c: usize| elems[c].2;
             let rule = px(RULE);
             // Slack per pixel of cell width, from the first informative gap.
             let mut k: Option<f32> = None;
             for c in 0..cols.saturating_sub(1) {
-                let gap = (elems[c + 1].0 - pad_x) - (elems[c].0 + elems[c].1 + pad_x) - rule;
+                let gap = (elems[c + 1].0 - pad_x)
+                    - (elems[c].0 + elems[c].1 + pad_x)
+                    - rule
+                    - elems[c].3 * share(c).1
+                    - elems[c + 1].3 * share(c + 1).0;
                 let denom =
                     share(c).1 * f32::from(cell_w(c)) + share(c + 1).0 * f32::from(cell_w(c + 1));
                 if denom > 0. {
@@ -444,7 +485,9 @@ impl FrameLayout {
                 && let Some(right) = content_right
             {
                 let last = cols - 1;
-                let gap = (right - rule) - (elems[last].0 + elems[last].1 + pad_x);
+                let gap = (right - rule)
+                    - (elems[last].0 + elems[last].1 + pad_x)
+                    - elems[last].3 * share(last).1;
                 let denom = share(last).1 * f32::from(cell_w(last));
                 if denom > 0. {
                     k = Some((f32::from(gap) / denom).max(0.));
@@ -454,7 +497,7 @@ impl FrameLayout {
             let mut col_spans: Vec<(Pixels, Pixels)> = (0..cols)
                 .map(|c| {
                     let (lead, trail) = share(c);
-                    let slack = cell_w(c) * k;
+                    let slack = cell_w(c) * k + elems[c].3;
                     let left = elems[c].0 - pad_x - slack * lead;
                     let right = elems[c].0 + elems[c].1 + pad_x + slack * trail;
                     let right = if c + 1 < cols { right + rule } else { right };

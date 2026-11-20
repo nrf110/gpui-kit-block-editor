@@ -1,5 +1,5 @@
-//! Hover-only table grips and their menu (D20). A grip shows above the
-//! hovered column's header cell and at the left edge of the hovered row;
+//! Hover-only table edge controls and their menu (D20). An ellipsis icon
+//! shows above the hovered column and to the left of the hovered row;
 //! clicking it selects that column / row as `BlockSelection::Cells` and
 //! opens a small menu of table commands.
 
@@ -14,9 +14,10 @@ use gpui_kit::base::text::editor_host::ColumnAlign;
 
 /// Extra reach around a table where its grips still show.
 const REACH: f32 = 28.;
-/// Row grips sit this far left of the table frame. The whole table is
-/// selected / dragged by its separate corner handle (`table_handles`).
-const ROW_GRIP_X: f32 = 8.;
+/// Space reserved inside each table block for its hover controls.
+pub(crate) const TABLE_CONTROL_GUTTER: f32 = 28.;
+const CONTROL_SIZE: f32 = 18.;
+const CONTROL_OUTSET: f32 = 26.;
 
 /// The open grip menu.
 #[derive(Clone, Debug, PartialEq)]
@@ -63,14 +64,10 @@ impl BlockEditorState {
                 .position(|(l, r)| x >= *l && x < *r)
                 .or_else(|| (x >= b.right() - px(2.)).then(|| g.cols.len() - 1))
                 .or_else(|| (x < g.cols[0].0).then_some(0));
-            if let Some(c) = col {
-                let (l, r) = g.cols[c];
-                let mid = (l + r) / 2.;
-                out.push((
-                    g.table,
-                    TableLine::Column(c),
-                    Bounds::new(point(mid - px(8.), b.top() - px(8.)), size(px(16.), px(4.))),
-                ));
+            if let Some(c) = col
+                && let Some(grip) = control_bounds(g, TableLine::Column(c))
+            {
+                out.push((g.table, TableLine::Column(c), grip));
             }
             let row = g
                 .rows
@@ -87,41 +84,38 @@ impl BlockEditorState {
                     let first = g.rows.iter().position(|(t, bt)| bt > t)?;
                     (y < g.rows[first].0).then_some(first)
                 });
-            if let Some(r) = row {
-                let (t, bt) = g.rows[r];
-                let h = px(16.).min(bt - t);
-                let mid = (t + bt) / 2.;
-                out.push((
-                    g.table,
-                    TableLine::Row(r),
-                    Bounds::new(
-                        point(b.left() - px(ROW_GRIP_X), mid - h / 2.),
-                        size(px(4.), h),
-                    ),
-                ));
+            if let Some(r) = row
+                && let Some(grip) = control_bounds(g, TableLine::Row(r))
+            {
+                out.push((g.table, TableLine::Row(r), grip));
             }
             break;
+        }
+        // Keep the active control visible while the pointer travels into
+        // its popover, even when it leaves the table's hover reach.
+        if let Some(menu) = &self.table_menu
+            && !out
+                .iter()
+                .any(|(table, line, _)| *table == menu.table && *line == menu.line)
+            && let Some(g) = frame.grids.iter().find(|g| g.table == menu.table)
+            && let Some(grip) = control_bounds(g, menu.line)
+        {
+            out.push((menu.table, menu.line, grip));
         }
         out
     }
 
-    /// The grip under `at`, if the pointer is on one (a little slack).
+    /// The control under `at`, with slack that never steals the corner handle.
     pub(crate) fn table_grip_hit(
         &self,
         at: Point<Pixels>,
     ) -> Option<(BlockId, TableLine, Bounds<Pixels>)> {
-        self.table_grips_at(at).into_iter().find(|(_, line, b)| {
-            // Row grips get vertical slack only, so the strip right of
-            // them still node-selects the table.
-            let slack = match line {
-                TableLine::Row(_) => Bounds::new(
-                    point(b.left() - px(4.), b.top() - px(3.)),
-                    size(b.size.width + px(6.), b.size.height + px(6.)),
-                ),
-                TableLine::Column(_) => b.dilate(px(5.)),
-            };
-            slack.contains(&at)
-        })
+        if self.table_handle_at(at).is_some() {
+            return None;
+        }
+        self.table_grips_at(at)
+            .into_iter()
+            .find(|(_, _, b)| b.dilate(px(2.)).contains(&at))
     }
 
     /// Click on a grip: select its row / column and open the menu.
@@ -130,6 +124,34 @@ impl BlockEditorState {
             return false;
         };
         self.open_table_menu(table, line, grip, cx);
+        true
+    }
+
+    /// Dismiss a whole-table object selection without editing shared content.
+    pub(crate) fn dismiss_table_selection(&mut self, cx: &mut Context<Self>) -> bool {
+        let super::selection::BlockSelection::Blocks { head, .. } = *self.model.selection() else {
+            return false;
+        };
+        let Some((parent, range)) = self.model.selected_blocks() else {
+            return false;
+        };
+        let doc = &self.model.doc;
+        if !doc.children(parent)[range].iter().any(|id| {
+            matches!(
+                doc.kind(*id),
+                Some(super::kind::BlockKindData::Table { .. })
+            )
+        }) {
+            return false;
+        }
+        let caret = doc.first_leaf_in(head);
+        // A concurrently emptied table may not have a caret to restore.
+        if doc.is_caret_leaf(caret.block) {
+            let _ = self.set_selection(super::selection::BlockSelection::caret(caret), cx);
+            self.reveal.set(false);
+        }
+        self.dragging = false;
+        self.block_drag = None;
         true
     }
 
@@ -244,6 +266,31 @@ impl BlockEditorState {
     }
 }
 
+fn control_bounds(g: &super::frame::TableGeom, line: TableLine) -> Option<Bounds<Pixels>> {
+    let side = px(CONTROL_SIZE);
+    let outset = px(CONTROL_OUTSET);
+    Some(match line {
+        TableLine::Column(c) => {
+            let (left, right) = *g.cols.get(c)?;
+            Bounds::new(
+                point((left + right - side) / 2., g.bounds.top() - outset),
+                size(side, side),
+            )
+        }
+        TableLine::Row(r) => {
+            let (top, bottom) = *g.rows.get(r)?;
+            if bottom <= top {
+                return None;
+            }
+            let height = side.min(bottom - top);
+            Bounds::new(
+                point(g.bounds.left() - outset, (top + bottom - height) / 2.),
+                size(side, height),
+            )
+        }
+    })
+}
+
 /// Shortcut text for a menu entry (Cmd on macOS, Ctrl elsewhere).
 pub(crate) fn shortcut(edit: TableEdit) -> Option<String> {
     let (m, alt) = if cfg!(target_os = "macos") {
@@ -296,6 +343,7 @@ pub(crate) fn render_menu(
         let entity = state.clone();
         div()
             .id(id)
+            .debug_selector(move || id.into())
             .flex()
             .flex_col()
             .px_2()
@@ -352,6 +400,7 @@ pub(crate) fn render_menu(
             div()
                 .id(id)
                 .px_2()
+                .debug_selector(move || id.into())
                 .py_0p5()
                 .rounded(px(4.))
                 .border_1()
@@ -397,6 +446,7 @@ pub(crate) fn render_menu(
                 .child(
                     div()
                         .id("block-editor-table-menu")
+                        .debug_selector(|| "block-editor-table-menu".into())
                         .occlude()
                         .min_w(px(220.))
                         .p_1()
@@ -407,6 +457,12 @@ pub(crate) fn render_menu(
                         .border_color(border)
                         .rounded(px(6.))
                         .shadow_md()
+                        // Padding, disabled entries and alignment labels
+                        // belong to the popover too, not the editor below.
+                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_mouse_up(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_mouse_move(|_, _, cx| cx.stop_propagation())
+                        .on_scroll(|_, _, cx| cx.stop_propagation())
                         .on_mouse_down_out(move |_, _, cx| {
                             entity.update(cx, |state, cx| state.close_table_menu(cx));
                         })
