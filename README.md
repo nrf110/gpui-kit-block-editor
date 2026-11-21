@@ -86,6 +86,10 @@ Each chevron hides only that item's descendants, independently on each replica. 
 
 **/mermaid** inserts a code block with semantic language `mermaid` and opens its native SVG preview. Hover for the source/preview toggle immediately left of the trash icon. Only one view is shown at a time; source edits refresh the preview asynchronously. Errors remain switchable back to source.
 
+Hover for **Expand diagram** to open a near-full-window viewer. Use **− / +** or the mouse wheel to zoom (25–800% relative to Fit), drag to pan, and **Fit** to recenter. Wheel zoom stays anchored at the pointer and does not scroll the document. Close with **Escape**, the close icon, or the backdrop. Zoom and pan are local: they do not change shared content or undo history. Open viewers refresh with diagram edits; deleted or non-diagram blocks show an unavailable message rather than stale content.
+
+The viewer retains parsed SVG and rasterizes off the UI thread at the displayed resolution, capped at 4096 pixels per texture side. Rapid camera changes coalesce behind one raster job.
+
 Preview mode is local to each editor. Diagrams work inside lists, quotes, and collapsibles. Rendering uses [mermaid-rs-renderer](https://github.com/1jehuang/mermaid-rs-renderer), without Node or a browser; syntax/fidelity follow that renderer rather than full Mermaid.js parity.
 
 ### Media attachments

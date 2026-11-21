@@ -3,6 +3,7 @@ extern crate gpui_kit as gpui;
 
 pub mod block;
 mod block_markdown;
+mod diagram_viewer;
 pub mod document;
 pub mod editor;
 pub mod extension;

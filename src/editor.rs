@@ -10,7 +10,7 @@ use anyhow::Context as _;
 
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
-    ActiveTheme, Icon, IconName, Sizable, StyledExt,
+    ActiveTheme, Disableable, Icon, IconName, Sizable, StyledExt, WindowExt,
     button::{Button, ButtonVariants},
     checkbox::Checkbox,
 };
@@ -27,6 +27,7 @@ use crate::{
     Document, SectionId,
     block::{BlockSpec, SectionKind, specs_from_rich},
     block_markdown::parse_blocks,
+    diagram_viewer::DiagramViewer,
     document::RelativePosition,
     extension::{CommandAction, ExtensionRegistry, SlashCommand},
     rich_map::{RichMap, RichPoint, SelectionKind, SelectionOffsets},
@@ -266,6 +267,7 @@ pub struct BlockEditor {
     active_block_drag: Option<EntityId>,
     grip_pressed: bool,
     completion: Option<Completion>,
+    expanded_diagram: Option<(SectionId, WeakEntity<DiagramViewer>)>,
     selection_dropdown: Option<SelectionDropdown>,
     selection_link: Option<SelectionLink>,
     selection_toolbar_target: Option<SectionId>,
@@ -349,6 +351,7 @@ impl BlockEditor {
             active_block_drag: None,
             grip_pressed: false,
             completion: None,
+            expanded_diagram: None,
             selection_dropdown: None,
             selection_link: None,
             selection_toolbar_target: None,
@@ -1358,6 +1361,12 @@ impl BlockEditor {
                 .get(id)
                 .is_some_and(|node| node.kind.is_editable())
         });
+        if let Some((id, _)) = &self.expanded_diagram {
+            if !self.views.contains_key(id) {
+                let id = id.clone();
+                self.sync_expanded_diagram(&id, cx);
+            }
+        }
         let mut changed = Vec::new();
         self.list_ends.clear();
         self.list_starts.clear();
@@ -1590,6 +1599,7 @@ impl BlockEditor {
             view.preview_task = None;
             view.preview = None;
             view.preview_error = None;
+            self.sync_expanded_diagram(id, cx);
             return;
         };
         view.previewable = true;
@@ -1613,10 +1623,79 @@ impl BlockEditor {
                         Ok(image) => view.preview = Some(image),
                         Err(error) => view.preview_error = Some(error),
                     }
+                    this.sync_expanded_diagram(&section, cx);
                     cx.notify();
                 }
             });
         }));
+        self.sync_expanded_diagram(id, cx);
+    }
+
+    fn sync_expanded_diagram(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some((section, viewer)) = &self.expanded_diagram else {
+            return;
+        };
+        if section != id {
+            return;
+        }
+        let Some(viewer) = viewer.upgrade() else {
+            self.expanded_diagram = None;
+            return;
+        };
+        let (image, error) = match self.views.get(id) {
+            Some(view) if view.previewable => (view.preview.clone(), view.preview_error.clone()),
+            _ => (
+                None,
+                Some("This diagram is no longer in the document.".to_owned()),
+            ),
+        };
+        viewer.update(cx, |viewer, cx| viewer.set_preview(image, error, cx));
+    }
+
+    fn expand_diagram(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(image) = self.views.get(id).and_then(|view| view.preview.clone()) else {
+            return;
+        };
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        self.completion = None;
+        self.selection_dropdown = None;
+        self.selection_link = None;
+        self.selection_toolbar_target = None;
+        let viewer = cx.new(|cx| DiagramViewer::new(image, window, cx));
+        self.expanded_diagram = Some((id.to_owned(), viewer.downgrade()));
+        let owner = cx.weak_entity();
+        let viewer_id = viewer.entity_id();
+        window.open_dialog(cx, move |dialog, window, _| {
+            let viewport = window.viewport_size();
+            let viewer = viewer.clone();
+            dialog
+                .width((viewport.width - px(48.)).max(px(1.)))
+                .h((viewport.height - px(48.)).max(px(1.)))
+                .min_h_0()
+                .centered()
+                .p_0()
+                .on_close({
+                    let owner = owner.clone();
+                    move |_, _, cx| {
+                        let _ = owner.update(cx, |this, cx| {
+                            if this
+                                .expanded_diagram
+                                .as_ref()
+                                .is_some_and(|(_, active)| active.entity_id() == viewer_id)
+                            {
+                                this.expanded_diagram = None;
+                                cx.notify();
+                            }
+                        });
+                    }
+                })
+                .content(move |content, _, _| {
+                    content.p_0().min_h_0().size_full().child(viewer.clone())
+                })
+        });
+        cx.notify();
     }
 
     fn toggle_preview(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -2290,6 +2369,7 @@ impl Render for BlockEditor {
             let preview = view.preview.clone();
             let preview_error = view.preview_error.clone();
             let previewable = view.previewable;
+            let can_expand = preview.is_some();
             let show_source = !previewable || view.show_source;
             let pending = preview.is_none() && preview_error.is_none();
             let indent = view.indent;
@@ -2299,6 +2379,7 @@ impl Render for BlockEditor {
             let collapsed = self.is_collapsed(&id);
             let collapse_id = id.clone();
             let toggle_id = id.clone();
+            let expand_id = id.clone();
             let select_id = id.clone();
             let drag_id = id.clone();
             let drag_owner = cx.weak_entity();
@@ -2579,7 +2660,7 @@ impl Render for BlockEditor {
                 .child(
                     div()
                         .mt_2()
-                        .w(px(60.))
+                        .w(px(if previewable { 92. } else { 60. }))
                         .flex()
                         .items_center()
                         .justify_end()
@@ -2589,6 +2670,18 @@ impl Render for BlockEditor {
                         .group_hover("block-section", |style| style.visible())
                         .when(previewable, |el| {
                             el.child(
+                                Button::new(("expand-preview", index))
+                                    .ghost()
+                                    .small()
+                                    .icon(IconName::Maximize)
+                                    .disabled(!can_expand)
+                                    .accessibility_label("Expand diagram")
+                                    .tooltip("Expand diagram")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.expand_diagram(&expand_id, window, cx);
+                                    })),
+                            )
+                            .child(
                                 Button::new(("toggle-preview", index))
                                     .ghost()
                                     .small()
@@ -2797,3 +2890,7 @@ mod media_editor_tests;
 #[cfg(test)]
 #[path = "block_navigation_tests.rs"]
 mod block_navigation_tests;
+
+#[cfg(test)]
+#[path = "diagram_editor_tests.rs"]
+mod diagram_editor_tests;
