@@ -127,34 +127,6 @@ impl BlockEditorState {
         true
     }
 
-    /// Dismiss a whole-table object selection without editing shared content.
-    pub(crate) fn dismiss_table_selection(&mut self, cx: &mut Context<Self>) -> bool {
-        let super::selection::BlockSelection::Blocks { head, .. } = *self.model.selection() else {
-            return false;
-        };
-        let Some((parent, range)) = self.model.selected_blocks() else {
-            return false;
-        };
-        let doc = &self.model.doc;
-        if !doc.children(parent)[range].iter().any(|id| {
-            matches!(
-                doc.kind(*id),
-                Some(super::kind::BlockKindData::Table { .. })
-            )
-        }) {
-            return false;
-        }
-        let caret = doc.first_leaf_in(head);
-        // A concurrently emptied table may not have a caret to restore.
-        if doc.is_caret_leaf(caret.block) {
-            let _ = self.set_selection(super::selection::BlockSelection::caret(caret), cx);
-            self.reveal.set(false);
-        }
-        self.dragging = false;
-        self.block_drag = None;
-        true
-    }
-
     /// Select `line` of `table` and open its menu below / beside `grip`.
     pub fn open_table_menu(
         &mut self,

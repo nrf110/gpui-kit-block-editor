@@ -40,6 +40,9 @@ use selection_toolbar::{SelectionDropdown, SelectionLink};
 #[path = "media_editor.rs"]
 mod media_editor;
 
+#[path = "block_navigation.rs"]
+mod block_navigation;
+
 /// Raw Yjs v1 updates. Remote application never echoes a local event.
 #[derive(Clone, Debug)]
 pub enum DocumentEvent {
@@ -182,6 +185,7 @@ struct SectionView {
     _subscription: Subscription,
     preview_task: Option<Task<()>>,
     media: Option<(MediaAttachment, Entity<MediaView>)>,
+    navigation_anchor: ScrollAnchor,
 }
 
 struct Completion {
@@ -259,6 +263,8 @@ pub struct BlockEditor {
     collapsed: HashMap<SectionId, bool>,
     block_selection: HashSet<SectionId>,
     block_anchor: Option<SectionId>,
+    active_block_drag: Option<EntityId>,
+    grip_pressed: bool,
     completion: Option<Completion>,
     selection_dropdown: Option<SelectionDropdown>,
     selection_link: Option<SelectionLink>,
@@ -310,7 +316,8 @@ impl BlockEditor {
                     return;
                 }
                 let handled = owner.update(cx, |this, cx| {
-                    this.handle_block_key(&event.keystroke, window, cx)
+                    this.handle_vertical_block_key(&event.keystroke, window, cx)
+                        || this.handle_block_key(&event.keystroke, window, cx)
                 });
                 if handled {
                     return;
@@ -339,6 +346,8 @@ impl BlockEditor {
             collapsed: HashMap::new(),
             block_selection: HashSet::new(),
             block_anchor: None,
+            active_block_drag: None,
+            grip_pressed: false,
             completion: None,
             selection_dropdown: None,
             selection_link: None,
@@ -769,6 +778,75 @@ impl BlockEditor {
                 .insert_block(parent.as_deref(), before, &spec)?;
         }
         self.reconcile(window, cx);
+        self.publish(&vector, cx);
+        Ok(())
+    }
+
+    fn insert_divider(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        self.flush_local_edits(window, cx)?;
+        self.capture_selections(cx)?;
+        let view = &self.views[id];
+        // A list/disclosure title remains a title; insert into its body instead.
+        let nested = view.kind.is_list_item() || view.kind.default_collapsed().is_some();
+        let parent = if nested {
+            Some(id.to_owned())
+        } else {
+            view.parent.clone()
+        };
+        let mut siblings = self
+            .tree_order
+            .iter()
+            .filter(|candidate| self.tree[*candidate].parent == parent);
+        let before = if nested {
+            siblings.next().cloned()
+        } else {
+            siblings.find(|candidate| candidate.as_str() == id);
+            siblings.next().cloned()
+        };
+        let replace = !nested
+            && !self
+                .tree
+                .values()
+                .any(|node| node.parent.as_deref() == Some(id))
+            && matches!(view.content.blocks.as_slice(), [node]
+                if matches!(node.kind, RichKind::Paragraph | RichKind::Heading)
+                    && node.children.is_empty()
+                    && node.runs.iter().all(|run| run.atom.is_none() && run.text.is_empty()));
+        let mut rule = RichDocument::paragraph("");
+        rule.blocks[0].kind = RichKind::HorizontalRule;
+        let vector = self.document.state_vector();
+        if replace {
+            self.document.set_content(id, &rule)?;
+        } else {
+            self.document.insert_block(
+                parent.as_deref(),
+                before.as_deref(),
+                &BlockSpec {
+                    kind: SectionKind::Text,
+                    content: rule,
+                    children: vec![],
+                },
+            )?;
+        }
+        let continuation = self.document.insert_block(
+            parent.as_deref(),
+            before.as_deref(),
+            &BlockSpec {
+                kind: SectionKind::Text,
+                content: RichDocument::paragraph(""),
+                children: vec![],
+            },
+        )?;
+        if nested {
+            self.collapsed.insert(id.to_owned(), false);
+        }
+        self.reconcile(window, cx);
+        self.focus_block_at(&continuation, None, window, cx)?;
         self.publish(&vector, cx);
         Ok(())
     }
@@ -1475,6 +1553,7 @@ impl BlockEditor {
                         _subscription: subscription,
                         preview_task: None,
                         media: None,
+                        navigation_anchor: ScrollAnchor::for_handle(self.scroll.clone()),
                     },
                 );
                 changed.push(section.id);
@@ -1679,6 +1758,7 @@ impl BlockEditor {
                     | EditorCommand::ToggleBlockquote
                     | EditorCommand::Indent
                     | EditorCommand::Outdent
+                    | EditorCommand::InsertBlock(NativeBlockKind::HorizontalRule)
             )
         );
         self.document.begin_history_group();
@@ -1706,6 +1786,11 @@ impl BlockEditor {
             match action {
                 CommandAction::InsertMarkdown(markdown) => {
                     self.insert_markup_after(id, &markdown, window, cx)?
+                }
+                CommandAction::Editor(EditorCommand::InsertBlock(
+                    NativeBlockKind::HorizontalRule,
+                )) => {
+                    self.insert_divider(id, window, cx)?;
                 }
                 CommandAction::Editor(command) if structural => {
                     let vector = self.document.state_vector();
@@ -1911,6 +1996,8 @@ impl BlockEditor {
         if !self.tree.contains_key(id) {
             return;
         }
+        // A new explicit selection supersedes deferred cleanup from an older drag.
+        self.active_block_drag = None;
         if modifiers.alt {
             let mut current = Some(id);
             while let Some(candidate) = current {
@@ -2127,6 +2214,22 @@ impl BlockEditor {
         zone.into_any_element()
     }
 
+    fn clear_block_selection(&mut self, cx: &mut Context<Self>) {
+        let changed = !self.block_selection.is_empty() || self.block_anchor.is_some();
+        self.block_selection.clear();
+        self.block_anchor = None;
+        self.active_block_drag = None;
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn finish_block_drag(&mut self, cx: &mut Context<Self>) {
+        if self.active_block_drag.is_some() {
+            self.clear_block_selection(cx);
+        }
+    }
+
     fn drop_sections(
         &mut self,
         dragged: &DraggedSection,
@@ -2158,6 +2261,7 @@ impl BlockEditor {
             self.completion = None;
             self.block_selection.clear();
             self.block_anchor = None;
+            self.active_block_drag = None;
             self.reconcile(window, cx);
             self.publish(&vector, cx);
             Ok(())
@@ -2245,6 +2349,7 @@ impl Render for BlockEditor {
                     .build(window, cx)
                 })
                 .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.grip_pressed = true;
                     window.prevent_default();
                     if !this.focus_scope.contains_focused(window, cx) {
                         this.focus_scope.focus(window, cx);
@@ -2261,7 +2366,23 @@ impl Render for BlockEditor {
                             .upgrade()
                             .map_or_else(Vec::new, |editor| editor.read(cx).drag_roots(&drag_id));
                         *dragged.roots.borrow_mut() = roots;
-                        cx.new(|_| dragged.clone())
+                        let preview = cx.new(|cx| {
+                            let owner = drag_owner.clone();
+                            let preview_id = cx.entity_id();
+                            cx.on_release(move |_, cx| {
+                                let _ = owner.update(cx, |this, cx| {
+                                    if this.active_block_drag == Some(preview_id) {
+                                        this.finish_block_drag(cx);
+                                    }
+                                });
+                            })
+                            .detach();
+                            dragged.clone()
+                        });
+                        let _ = drag_owner.update(cx, |this, _| {
+                            this.active_block_drag = Some(preview.entity_id());
+                        });
+                        preview
                     },
                 );
             #[cfg(test)]
@@ -2334,6 +2455,7 @@ impl Render for BlockEditor {
                     div()
                         .id(SharedString::from(id.clone()))
                         .group("block-section")
+                        .anchor_scroll(Some(view.navigation_anchor.clone()))
                         .w_full()
                         .pl(px(indent as f32 * 24.))
                         .flex()
@@ -2575,6 +2697,26 @@ impl Render for BlockEditor {
             .size_full()
             .flex()
             .flex_col()
+            .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, _, _| {
+                if event.button == MouseButton::Left {
+                    // The grip's bubbling handler marks only actual grip presses.
+                    this.grip_pressed = false;
+                }
+            }))
+            .on_mouse_down_out(cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                if event.button == MouseButton::Left {
+                    this.grip_pressed = false;
+                    this.clear_block_selection(cx);
+                }
+            }))
+            .capture_any_mouse_up(cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                if event.button == MouseButton::Left {
+                    this.finish_block_drag(cx);
+                    if !std::mem::take(&mut this.grip_pressed) {
+                        this.clear_block_selection(cx);
+                    }
+                }
+            }))
             .when_some(self.error.clone(), |el, error| {
                 el.child(div().p_3().text_color(cx.theme().danger).child(error))
             })
@@ -2651,3 +2793,7 @@ mod table_editor_tests;
 #[cfg(test)]
 #[path = "media_editor_tests.rs"]
 mod media_editor_tests;
+
+#[cfg(test)]
+#[path = "block_navigation_tests.rs"]
+mod block_navigation_tests;

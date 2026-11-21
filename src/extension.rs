@@ -38,6 +38,7 @@ gpui_kit::assets::icon_assets!(
         File,
         Workflow,
         MessageSquareText,
+        Minus,
     ]
 );
 
@@ -363,6 +364,19 @@ impl Default for CommandRegistry {
                 action: CommandAction::CollapsibleList,
             })
             .expect("the built-in collapsible list command ID is unique");
+        registry
+            .register(SlashCommand {
+                id: "divider".into(),
+                title: "Divider".into(),
+                group: "Layout".into(),
+                icon: IconName::Minus,
+                description: "Separate content with a horizontal line".into(),
+                keywords: vec!["rule".into(), "horizontal".into(), "separator".into()],
+                action: CommandAction::Editor(EditorCommand::InsertBlock(
+                    BlockKind::HorizontalRule,
+                )),
+            })
+            .expect("the built-in divider command ID is unique");
         for (id, title, description, keywords, kind) in [
             (
                 "image",

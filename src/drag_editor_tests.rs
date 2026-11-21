@@ -1,8 +1,9 @@
 use super::collaboration_tests::{replica, select, set_text, setup};
-use super::{BlockEditor, SectionKind};
-use gpui_kit::test::TestWindowExt;
+use super::{BlockEditor, Document, SectionKind};
+use gpui_kit::test::{TestEventExt, TestWindowExt};
 use gpui_kit::{
-    App, AppContext, ElementId, Entity, Modifiers, SharedString, TestAppContext, Window,
+    App, AppContext, ElementId, Entity, Modifiers, MouseButton, SharedString, TestAppContext,
+    Window, point, px,
 };
 
 fn click_grip(
@@ -474,6 +475,244 @@ fn dragging_a_parent_onto_its_descendant_is_a_silent_noop(cx: &mut TestAppContex
     .unwrap();
     editor.read_with(cx, |editor, _| {
         assert_eq!(editor.document.sections(), before);
+        assert!(editor.block_selection.is_empty());
+        assert!(editor.block_anchor.is_none());
         assert!(editor.error.is_none(), "{:?}", editor.error);
     });
+}
+
+#[gpui_kit::test]
+fn dragging_back_to_the_same_block_clears_selection_without_changing_content(
+    cx: &mut TestAppContext,
+) {
+    for source in ["---\n\nAfter", "First\n\nAfter"] {
+        let (handle, editor, id) = setup(source, cx);
+        let original = editor.read_with(cx, |editor, _| editor.document.sections());
+        let vector = editor.read_with(cx, |editor, _| editor.document.state_vector());
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            click_grip(&editor, &id, Modifiers::none(), window, cx);
+            assert!(editor.read(cx).block_is_selected(&id));
+            drag_grip(&editor, &id, SharedString::from(id.clone()), window, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        editor.read_with(cx, |editor, _| {
+            assert!(editor.block_selection.is_empty());
+            assert!(editor.block_anchor.is_none());
+            assert!(editor.active_block_drag.is_none());
+            assert_eq!(editor.document.sections(), original);
+            assert_eq!(editor.document.state_vector(), vector);
+            assert!(!editor.document.can_undo());
+        });
+        cx.update_window(handle, |_, window, cx| {
+            click_grip(&editor, &id, Modifiers::none(), window, cx);
+        })
+        .unwrap();
+        assert!(editor.read_with(cx, |editor, _| editor.block_is_selected(&id)));
+    }
+}
+
+#[gpui_kit::test]
+fn cancelling_a_drag_without_mouse_up_clears_its_selection(cx: &mut TestAppContext) {
+    let (handle, editor, id) = setup("---\n\nAfter", cx);
+    let original = editor.read_with(cx, |editor, _| editor.document.sections());
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.hover(SharedString::from(id.clone()), cx);
+        let from = window.find(("grip", 0usize)).bounds().center();
+        window.pointer_down(from, MouseButton::Left, cx);
+        window.pointer_move(from + point(px(80.), px(0.)), Some(MouseButton::Left), cx);
+        assert!(cx.has_active_drag());
+        assert!(editor.read(cx).active_block_drag.is_some());
+        assert!(cx.stop_active_drag(window));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    editor.read_with(cx, |editor, _| {
+        assert!(editor.block_selection.is_empty());
+        assert!(editor.block_anchor.is_none());
+        assert!(editor.active_block_drag.is_none());
+        assert_eq!(editor.document.sections(), original);
+        assert!(!editor.document.can_undo());
+    });
+}
+
+#[gpui_kit::test]
+fn plain_grip_selection_clears_when_clicking_content_or_blank_space(cx: &mut TestAppContext) {
+    for source in [
+        "First\n\nAfter",
+        "# Heading\n\nAfter",
+        "- Item\n\nAfter",
+        "---\n\nAfter",
+        "```rust\nlet value = 1;\n```\n\nAfter",
+        "| Header |\n| --- |\n| Cell |\n\nAfter",
+        "<details><summary>Title</summary>\n\nBody\n\n</details>\n\nAfter",
+    ] {
+        for target in 0..3 {
+            let (handle, editor, id) = setup(source, cx);
+            let original = editor.read_with(cx, |editor, _| editor.document.sections());
+            let vector = editor.read_with(cx, |editor, _| editor.document.state_vector());
+            let last = editor.read_with(cx, |editor, _| editor.order.len() - 1);
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                click_grip(&editor, &id, Modifiers::none(), window, cx);
+                assert!(editor.read(cx).block_is_selected(&id));
+                match target {
+                    0 => window.click(("section-source", 0usize), cx),
+                    1 => window.click(("section-source", last), cx),
+                    _ => {
+                        let blank = window.find("append-section").bounds();
+                        window.click_at(
+                            "append-section",
+                            point(blank.size.width - px(4.), blank.size.height - px(4.)),
+                            cx,
+                        );
+                    }
+                }
+                let state = editor.read(cx);
+                assert!(
+                    state.block_selection.is_empty(),
+                    "source={source:?}, target={target}"
+                );
+                assert!(state.block_anchor.is_none());
+                assert_eq!(state.document.sections(), original);
+                assert_eq!(state.document.state_vector(), vector);
+                assert!(!state.document.can_undo());
+            })
+            .unwrap();
+            if target == 1 {
+                cx.update_window(handle, |_, window, cx| window.input("!", cx))
+                    .unwrap();
+                editor.read_with(cx, |editor, _| {
+                    assert_eq!(
+                        editor
+                            .document
+                            .sections()
+                            .last()
+                            .unwrap()
+                            .content
+                            .plain_text(),
+                        "After!"
+                    );
+                    assert!(editor.error.is_none(), "{:?}", editor.error);
+                });
+            }
+        }
+    }
+}
+
+#[gpui_kit::test]
+fn clearing_a_grip_range_resets_the_next_shift_click_anchor(cx: &mut TestAppContext) {
+    let (handle, editor, first) = setup("First\n\nMiddle\n\nLast", cx);
+    let last = editor.read_with(cx, |editor, _| editor.order[2].clone());
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        click_grip(&editor, &first, Modifiers::none(), window, cx);
+        click_grip(
+            &editor,
+            &last,
+            Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+            window,
+            cx,
+        );
+        assert_eq!(editor.read(cx).block_selection.len(), 3);
+        window.click(("section-source", 1usize), cx);
+        assert!(editor.read(cx).block_selection.is_empty());
+        click_grip(
+            &editor,
+            &last,
+            Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+            window,
+            cx,
+        );
+        assert_eq!(
+            editor.read(cx).block_selection,
+            std::collections::HashSet::from([last.clone()])
+        );
+        assert!(!editor.read(cx).document.can_undo());
+    })
+    .unwrap();
+}
+
+struct OutsideGripControlHost {
+    editor: Entity<BlockEditor>,
+    clicks: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+impl gpui_kit::Render for OutsideGripControlHost {
+    fn render(
+        &mut self,
+        _: &mut Window,
+        _: &mut gpui_kit::Context<Self>,
+    ) -> impl gpui_kit::IntoElement {
+        use gpui_kit::test::TestSupportExt;
+        use gpui_kit::{InteractiveElement, ParentElement, Styled, div};
+
+        let clicks = self.clicks.clone();
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(div().h(px(420.)).w_full().child(self.editor.clone()))
+            .child(
+                div()
+                    .id("outside-grip-control")
+                    .h(px(40.))
+                    .w_full()
+                    .child("Outside control")
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        clicks.set(clicks.get() + 1);
+                        cx.stop_propagation();
+                    })
+                    .test_support(),
+            )
+    }
+}
+
+#[gpui_kit::test]
+fn an_outside_control_dismisses_grip_selection_before_consuming_the_click(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::init(cx);
+    });
+    let clicks = std::rc::Rc::new(std::cell::Cell::new(0));
+    let counter = clicks.clone();
+    let (handle, host) = cx.update(|cx| {
+        gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
+            let mut document = Document::new();
+            document.insert_section(None, "First\n\nAfter").unwrap();
+            document.clear_history();
+            let editor = cx.new(|cx| {
+                BlockEditor::new(document, crate::ExtensionRegistry::default(), window, cx)
+            });
+            cx.new(|_| OutsideGripControlHost {
+                editor,
+                clicks: counter,
+            })
+        })
+        .unwrap()
+    });
+    let editor = host.read_with(cx, |host, _| host.editor.clone());
+    let id = editor.read_with(cx, |editor, _| editor.order[0].clone());
+    let original = editor.read_with(cx, |editor, _| editor.document.sections());
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        click_grip(&editor, &id, Modifiers::none(), window, cx);
+        assert!(editor.read(cx).block_is_selected(&id));
+        window.click("outside-grip-control", cx);
+        assert_eq!(clicks.get(), 1);
+        assert!(editor.read(cx).block_selection.is_empty());
+        assert!(editor.read(cx).block_anchor.is_none());
+        assert_eq!(editor.read(cx).document.sections(), original);
+        assert!(!editor.read(cx).document.can_undo());
+    })
+    .unwrap();
 }

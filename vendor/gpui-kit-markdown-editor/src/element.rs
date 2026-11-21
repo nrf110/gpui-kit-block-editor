@@ -804,9 +804,9 @@ impl Element for EditorRoot {
                 && !hitbox.is_hovered(window)
             {
                 // Blank space need not move focus, and other controls may
-                // stop bubbling. Dismiss before either can leave a stale
-                // table object selection behind; table menus use Cells.
-                let dismissed = entity.update(cx, |state, cx| state.dismiss_table_selection(cx));
+                // stop bubbling. Dismiss object selections in capture before
+                // either leaves stale highlighting behind; table menus use Cells.
+                let dismissed = entity.update(cx, |state, cx| state.dismiss_object_selection(cx));
                 if dismissed && entity.read(cx).focus_handle.is_focused(window) {
                     window.blur(cx);
                 }

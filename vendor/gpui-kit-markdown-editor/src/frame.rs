@@ -11,7 +11,7 @@ use std::{collections::HashMap, ops::Range, rc::Rc};
 
 use gpui::{Bounds, Pixels, Point, point, px, size};
 use gpui_kit::base::text::editor_host::{Caret, ColumnAlign, LeafGeometry};
-use unicode_segmentation::UnicodeSegmentation as _;
+use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation as _};
 
 use super::{
     document::EditorDocument, id::BlockId, position::BlockPosition, projection::LeafInfo,
@@ -208,6 +208,82 @@ impl FrameLayout {
         Some(Bounds::new(origin, size(width, h)))
     }
 
+    /// Whether this caret is on the leaf's first/last visual row.
+    pub(crate) fn at_vertical_edge(&self, pos: BlockPosition, down: bool) -> Option<bool> {
+        let leaf = self.leaf(pos.block)?;
+        let y = leaf.caret_point(pos.offset).y;
+        let edge = leaf.caret_point(if down { leaf.info.len } else { 0 }).y;
+        Some(if down { y >= edge } else { y <= edge })
+    }
+
+    /// Enter one model row (one leaf, or all cells of a table row).
+    /// Restrict candidates to that row even when surrounding geometry is culled.
+    pub(crate) fn vertical_entry(
+        &self,
+        doc: &EditorDocument,
+        blocks: &[BlockId],
+        x: Pixels,
+        down: bool,
+    ) -> Option<BlockPosition> {
+        let leaf = blocks
+            .iter()
+            .filter_map(|block| self.leaf(*block))
+            .min_by(|a, b| {
+                self.horizontal_distance(a, x)
+                    .partial_cmp(&self.horizontal_distance(b, x))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })?;
+        let edge = if down { 0 } else { leaf.info.len };
+        let row = leaf.caret_point(edge).y;
+        let mut offset = leaf.offset_at(point(x, row + leaf.line_height() / 2.));
+        if let Some(text) = doc.leaf_text(leaf.info.block) {
+            offset = offset.min(text.len());
+            while !text.is_char_boundary(offset) {
+                offset -= 1;
+            }
+            let on_row =
+                |offset| (leaf.caret_point(offset).y - row).abs() < leaf.line_height() / 2.;
+            let mut cursor = GraphemeCursor::new(offset, text.len(), true);
+            if !cursor.is_boundary(text, 0).unwrap_or(false) || !on_row(offset) {
+                // A shaped index can fall inside a grapheme, or at the next
+                // row's downstream wrap offset. Pick the closest valid caret
+                // that still belongs to the entry row.
+                let before = cursor.prev_boundary(text, 0).ok().flatten();
+                let after = GraphemeCursor::new(offset, text.len(), true)
+                    .next_boundary(text, 0)
+                    .ok()
+                    .flatten();
+                offset = [before, after]
+                    .into_iter()
+                    .flatten()
+                    .filter(|offset| on_row(*offset))
+                    .min_by(|a, b| {
+                        (leaf.caret_point(*a).x - x)
+                            .abs()
+                            .partial_cmp(&(leaf.caret_point(*b).x - x).abs())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .unwrap_or(edge);
+            }
+        }
+        Some(BlockPosition::new(leaf.info.block, offset))
+    }
+
+    fn horizontal_distance(&self, leaf: &LeafGeom, x: Pixels) -> Pixels {
+        let bounds = self
+            .cell_boxes
+            .get(&leaf.info.block)
+            .copied()
+            .unwrap_or_else(|| leaf.bounds());
+        if x < bounds.left() {
+            bounds.left() - x
+        } else if x > bounds.right() {
+            x - bounds.right()
+        } else {
+            px(0.)
+        }
+    }
+
     pub(crate) fn selection_bounds(
         &self,
         doc: &EditorDocument,
@@ -286,21 +362,7 @@ impl FrameLayout {
         while hi + 1 < self.leaves.len() && overlaps(hi + 1) {
             hi += 1;
         }
-        let distance = |i: usize| {
-            let leaf = &self.leaves[i];
-            let b = self
-                .cell_boxes
-                .get(&leaf.info.block)
-                .copied()
-                .unwrap_or_else(|| leaf.bounds());
-            if x < b.left() {
-                b.left() - x
-            } else if x > b.right() {
-                x - b.right()
-            } else {
-                px(0.)
-            }
-        };
+        let distance = |i: usize| self.horizontal_distance(&self.leaves[i], x);
         (lo..=hi)
             .min_by(|a, b| {
                 distance(*a)

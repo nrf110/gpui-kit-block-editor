@@ -427,6 +427,7 @@ impl BlockEditorState {
                 cx.emit(BlockEditorEvent::Focus);
             }),
             cx.on_blur(&focus_handle, window, |this, _, cx| {
+                this.dismiss_object_selection(cx);
                 this.blink_cursor.update(cx, |b, cx| b.stop(cx));
                 this.model.break_coalescing();
                 this.end_composition();
@@ -783,6 +784,160 @@ impl BlockEditorState {
         window.focus(&self.focus_handle, cx);
     }
 
+    fn is_vertical_leaf(&self, block: BlockId) -> bool {
+        use super::kind::BlockKindData;
+        // Match the shared renderer's non-drawing leaf kinds. Empty text
+        // blocks still provide a real caret row and remain navigable.
+        !matches!(
+            self.model.doc.kind(block),
+            Some(
+                BlockKindData::Definition { .. }
+                    | BlockKindData::Break { .. }
+                    | BlockKindData::Unknown
+            )
+        )
+    }
+
+    fn vertical_edge_leaf(&self, end: bool) -> Option<BlockId> {
+        let mut leaves = self
+            .model
+            .doc
+            .leaves()
+            .iter()
+            .copied()
+            .filter(|block| self.is_vertical_leaf(*block));
+        if end {
+            leaves.next_back()
+        } else {
+            leaves.next()
+        }
+    }
+
+    /// Preferred window-space x when plain Up/Down would leave this editor.
+    /// Text ranges and composition remain under native selection handling.
+    pub fn vertical_boundary_x(&self, down: bool) -> Option<Pixels> {
+        if self.marked.is_some() || self.composition_open {
+            return None;
+        }
+        let doc = &self.model.doc;
+        let is_atom = |block| {
+            doc.get(block).is_some_and(|entry| {
+                matches!(&entry.content, super::document::BlockContent::Atom(_))
+            })
+        };
+        let head = match *self.model.selection() {
+            BlockSelection::Text { anchor, head } if anchor == head => head,
+            BlockSelection::Text { anchor, head }
+                if anchor.block == head.block && is_atom(head.block) =>
+            {
+                BlockPosition::new(head.block, usize::from(down))
+            }
+            BlockSelection::Blocks { anchor, head } if anchor == head && is_atom(head) => {
+                BlockPosition::new(head, usize::from(down))
+            }
+            _ => return None,
+        };
+        // Cells are ordered row-major in the model. A different column of
+        // this same row is not a preceding/following vertical destination.
+        let edge_block = if doc.kind(head.block) == Some(&super::kind::BlockKindData::TableCell) {
+            let cells = doc.children(doc.parent(head.block)?);
+            if down {
+                *cells.last()?
+            } else {
+                *cells.first()?
+            }
+        } else {
+            head.block
+        };
+        let boundary = self.vertical_edge_leaf(down)?;
+        if edge_block != boundary {
+            return None;
+        }
+        let frame = self.frame.borrow();
+        if !is_atom(head.block)
+            && !frame.at_vertical_edge(head, down).unwrap_or_else(|| {
+                // Without geometry, only an actual model endpoint proves
+                // that no wrapped or code row remains in this direction.
+                head.offset
+                    == if down {
+                        doc.leaf_len(head.block).unwrap_or(0)
+                    } else {
+                        0
+                    }
+            })
+        {
+            return None;
+        }
+        Some(
+            self.goal_x
+                .or_else(|| {
+                    frame
+                        .leaf(head.block)
+                        .map(|leaf| leaf.caret_point(head.offset).x)
+                })
+                .or_else(|| frame.content.or(frame.viewport).map(|bounds| bounds.left()))
+                .unwrap_or(gpui::px(0.)),
+        )
+    }
+
+    /// Focus the first/last visual row from a neighbouring outer editor.
+    /// Selection and reveal change, but content and undo history do not.
+    pub fn focus_vertical_entry(
+        &mut self,
+        down: bool,
+        x: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.marked.is_some() || self.composition_open {
+            return false;
+        }
+        let doc = &self.model.doc;
+        let Some(block) = self.vertical_edge_leaf(!down) else {
+            return false;
+        };
+        let selection = if doc
+            .get(block)
+            .is_some_and(|entry| matches!(&entry.content, super::document::BlockContent::Atom(_)))
+        {
+            // Atomic leaves have no text geometry. Select their visible
+            // object instead of focusing an invisible before/after caret.
+            BlockSelection::Blocks {
+                anchor: block,
+                head: block,
+            }
+        } else {
+            let row = if doc.kind(block) == Some(&super::kind::BlockKindData::TableCell) {
+                doc.parent(block).map(|parent| doc.children(parent))
+            } else {
+                None
+            };
+            let candidates = row.unwrap_or_else(|| std::slice::from_ref(&block));
+            let target = self
+                .frame
+                .borrow()
+                .vertical_entry(doc, candidates, x, down)
+                .unwrap_or_else(|| {
+                    BlockPosition::new(
+                        block,
+                        if down {
+                            0
+                        } else {
+                            doc.leaf_len(block).unwrap_or(0)
+                        },
+                    )
+                });
+            BlockSelection::caret(doc.clamp(target))
+        };
+        if self.model.set_selection(selection).is_err() {
+            return false;
+        }
+        self.goal_x = Some(x);
+        self.focus(window, cx);
+        self.selection_changed(cx);
+        true
+    }
+
     /// Set the selection; emits `SelectionChanged`.
     pub fn set_selection(
         &mut self,
@@ -932,6 +1087,48 @@ impl BlockEditorState {
         self.pause_blink(cx);
         cx.emit(BlockEditorEvent::SelectionChanged);
         cx.notify();
+    }
+
+    /// Dismiss object selections without editing content or revealing the old caret.
+    /// Ordinary text ranges and table-cell selections survive focus in toolbar controls.
+    pub(crate) fn dismiss_object_selection(&mut self, cx: &mut Context<Self>) -> bool {
+        let doc = &self.model.doc;
+        let is_atom = |id| {
+            doc.get(id).is_some_and(|entry| {
+                matches!(&entry.content, super::document::BlockContent::Atom(_))
+            })
+        };
+        let caret = match *self.model.selection() {
+            BlockSelection::Blocks { head, .. } => {
+                let Some((parent, range)) = self.model.selected_blocks() else {
+                    return false;
+                };
+                if !doc.children(parent)[range].iter().any(|id| {
+                    is_atom(*id)
+                        || matches!(
+                            doc.kind(*id),
+                            Some(super::kind::BlockKindData::Table { .. })
+                        )
+                }) {
+                    return false;
+                }
+                doc.first_leaf_in(head)
+            }
+            BlockSelection::Text { anchor, head }
+                if anchor != head && anchor.block == head.block && is_atom(head.block) =>
+            {
+                head
+            }
+            _ => return false,
+        };
+        // A concurrently emptied table may not have a caret to restore.
+        if doc.is_caret_leaf(caret.block) {
+            let _ = self.set_selection(BlockSelection::caret(caret), cx);
+            self.reveal.set(false);
+        }
+        self.dragging = false;
+        self.block_drag = None;
+        true
     }
 
     fn pause_blink(&mut self, cx: &mut Context<Self>) {
@@ -1181,32 +1378,94 @@ impl BlockEditorState {
     }
 
     fn vertical(&mut self, down: bool, extend: bool, cx: &mut Context<Self>) {
-        if self.collapse_blocks(down, cx) {
+        let atom = if extend {
+            None
+        } else {
+            match *self.model.selection() {
+                BlockSelection::Blocks { anchor, head } if anchor == head => Some(head),
+                BlockSelection::Text { anchor, head } if anchor.block == head.block => {
+                    Some(head.block)
+                }
+                _ => None,
+            }
+            .filter(|block| {
+                self.model.doc.get(*block).is_some_and(|entry| {
+                    matches!(&entry.content, super::document::BlockContent::Atom(_))
+                })
+            })
+        };
+        if atom.is_none() && self.collapse_blocks(down, cx) {
             return;
         }
-        let Some((_, head)) = self.head_anchor() else {
+        let Some(head) = atom
+            .map(|block| BlockPosition::new(block, usize::from(down)))
+            .or_else(|| self.head_anchor().map(|(_, head)| head))
+        else {
             return;
         };
-        let leaves = self.snapshot().leaves.clone();
-        let Some(ix) = leaves.iter().position(|l| l.block == head.block) else {
+        let doc = &self.model.doc;
+        let leaves = doc.leaves();
+        let row = (doc.kind(head.block) == Some(&super::kind::BlockKindData::TableCell))
+            .then(|| doc.parent(head.block))
+            .flatten();
+        let edge = row.map_or(head.block, |row| {
+            if down {
+                doc.last_leaf_in(row).block
+            } else {
+                doc.first_leaf_in(row).block
+            }
+        });
+        let Some(ix) = doc.order.rank(edge).map(|rank| rank as usize) else {
             return;
         };
-        // The model-adjacent caret leaf, which may be culled (no geometry).
+        // A model-adjacent vertical row, not the next column in this row.
+        // Keep the column when the destination row has no frame geometry.
         let adjacent = if down {
-            leaves.get(ix + 1)
+            leaves[ix + 1..]
+                .iter()
+                .copied()
+                .find(|block| self.is_vertical_leaf(*block))
         } else {
-            ix.checked_sub(1).and_then(|i| leaves.get(i))
-        };
+            leaves[..ix]
+                .iter()
+                .rev()
+                .copied()
+                .find(|block| self.is_vertical_leaf(*block))
+        }
+        .map(|next| {
+            if row.is_some()
+                && doc.kind(next) == Some(&super::kind::BlockKindData::TableCell)
+                && let Some((_, column)) = doc.index_in_parent(head.block)
+                && let Some(next_row) = doc.parent(next)
+            {
+                let cells = doc.children(next_row);
+                cells
+                    .get(column)
+                    .or_else(|| cells.last())
+                    .copied()
+                    .unwrap_or(next)
+            } else {
+                next
+            }
+        });
+        let table = row.and_then(|row| doc.parent(row));
+        let last_table_row = table.is_some()
+            && !adjacent
+                .is_some_and(|next| doc.parent(next).and_then(|row| doc.parent(row)) == table);
         let frame = self.frame.clone();
         let frame = frame.borrow();
-        let laid_out = frame.caret_bounds(head, self.style.caret_width());
-        let x = laid_out.map(|caret| *self.goal_x.get_or_insert(caret.origin.x));
+        let x = self.goal_x.or_else(|| {
+            frame
+                .caret_bounds(head, self.style.caret_width())
+                .map(|caret| caret.origin.x)
+        });
+        self.goal_x = x;
         let visual = x.and_then(|x| frame.vertical(head, x, down));
         let target = match (visual, adjacent) {
             // Within the block, or into the laid-out adjacent leaf.
             (Some(t), _) if t.block == head.block => t,
             // Down past a table's last row leaves the table (D13).
-            _ if down && !extend && self.model.in_last_table_row() => {
+            _ if down && !extend && last_table_row => {
                 drop(frame);
                 self.edit(
                     EditOrigin::Command("table_exit"),
@@ -1215,20 +1474,22 @@ impl BlockEditorState {
                 );
                 return;
             }
-            (Some(t), Some(next)) if t.block == next.block => t,
-            // Up/down inside a table goes to the cell above/below (cells of
-            // one table are laid out together).
-            (Some(t), _)
-                if super::table::table_of(&self.model.doc, head.block).is_some_and(|table| {
-                    super::table::table_of(&self.model.doc, t.block) == Some(table)
-                }) =>
+            (Some(t), Some(next))
+                if t.block == next
+                    || (doc.kind(next) == Some(&super::kind::BlockKindData::TableCell)
+                        && doc.kind(t.block) == Some(&super::kind::BlockKindData::TableCell)
+                        && doc.parent(t.block) == doc.parent(next)) =>
             {
                 t
             }
             // Into a culled (or not yet laid-out) leaf: model fallback.
             (_, Some(next)) => {
-                let offset = if down { 0 } else { next.len };
-                BlockPosition::new(next.block, offset)
+                let offset = if down {
+                    0
+                } else {
+                    doc.leaf_len(next).unwrap_or(0)
+                };
+                BlockPosition::new(next, offset)
             }
             (_, None) if down && self.model.doc.plain(head.block).is_some() && !extend => {
                 drop(frame);
@@ -1240,17 +1501,33 @@ impl BlockEditorState {
                 return;
             }
             (_, None) => {
-                let doc = &self.model.doc;
-                if down {
-                    doc.last_caret()
-                } else {
-                    doc.first_caret()
-                }
+                let block = self.vertical_edge_leaf(down).unwrap_or(head.block);
+                BlockPosition::new(
+                    block,
+                    if down {
+                        doc.leaf_len(block).unwrap_or(0)
+                    } else {
+                        0
+                    },
+                )
             }
         };
         drop(frame);
         let goal = self.goal_x;
-        self.move_to(self.model.doc.clamp(target), extend, cx);
+        let target = self.model.doc.clamp(target);
+        if !extend
+            && self.model.doc.get(target.block).is_some_and(|entry| {
+                matches!(&entry.content, super::document::BlockContent::Atom(_))
+            })
+        {
+            let _ = self.model.set_selection(BlockSelection::Blocks {
+                anchor: target.block,
+                head: target.block,
+            });
+            self.selection_changed(cx);
+        } else {
+            self.move_to(target, extend, cx);
+        }
         self.goal_x = goal;
     }
 

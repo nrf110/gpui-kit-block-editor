@@ -2,8 +2,8 @@ use super::collaboration_tests::{select, setup as setup_content};
 use super::{BlockEditor, Document, ExtensionRegistry};
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{
-    AnyWindowHandle, AppContext, Bounds, Entity, ScrollDelta, SharedString, TestAppContext,
-    WindowBounds, WindowOptions, point, px, size,
+    AnyWindowHandle, AppContext, Bounds, Entity, Focusable, ScrollDelta, SharedString,
+    TestAppContext, WindowBounds, WindowOptions, point, px, size,
 };
 
 fn setup(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<BlockEditor>) {
@@ -570,4 +570,304 @@ fn command_menu_wheel_scrolling_does_not_scroll_the_document_even_at_its_edges(
         assert!(editor.read(cx).scroll.offset().y < page_offset.y);
     })
     .unwrap();
+}
+
+fn click_divider_menu(window: &mut gpui_kit::Window, cx: &mut gpui_kit::App, index: usize) {
+    window.click(("block-menu", index), cx);
+    let viewport = window.find("slash-menu-items").bounds();
+    let command = window.find("divider").bounds();
+    window.scroll(
+        "slash-menu-items",
+        ScrollDelta::Pixels(point(px(0.), viewport.bottom() - command.bottom() - px(4.))),
+        cx,
+    );
+    assert!(
+        window
+            .find("slash-menu-items")
+            .bounds()
+            .contains(&window.find("divider").bounds().center())
+    );
+    window.click("divider", cx);
+}
+
+#[gpui_kit::test]
+fn divider_slash_replaces_an_empty_block_and_continues_typing_with_one_undo(
+    cx: &mut TestAppContext,
+) {
+    let (handle, editor) = setup(cx);
+    let id = editor.read_with(cx, |editor, _| editor.order[0].clone());
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.input("/divider", cx);
+    })
+    .unwrap();
+    cx.update_window(handle, |_, window, cx| window.press("enter", cx))
+        .unwrap();
+    let inserted = editor.read_with(cx, |editor, _| {
+        let sections = editor.document.sections();
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].id, id);
+        assert_eq!(
+            sections[0].content.blocks[0].kind,
+            crate::RichKind::HorizontalRule
+        );
+        assert_eq!(
+            sections[1].content.blocks[0].kind,
+            crate::RichKind::Paragraph
+        );
+        assert!(sections[1].content.plain_text().is_empty());
+        let restored = Document::import_json(&editor.document.export_json().unwrap()).unwrap();
+        assert_eq!(restored.sections(), sections);
+        let mut peer = Document::new();
+        peer.apply_update(&editor.document.encode_state()).unwrap();
+        assert_eq!(peer.sections(), sections);
+        assert_eq!(editor.markdown().trim(), "---");
+        assert!(editor.error.is_none(), "{:?}", editor.error);
+        sections
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        let rule = window.find(SharedString::from(id.clone())).bounds();
+        let text = window
+            .find(SharedString::from(inserted[1].id.clone()))
+            .bounds();
+        assert!(rule.size.width > px(0.));
+        assert!(rule.bottom() <= text.top());
+        assert!(
+            editor.read(cx).views[&inserted[1].id]
+                .editor
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        );
+        window.press("cmd-z", cx);
+    })
+    .unwrap();
+    editor.read_with(cx, |editor, _| {
+        assert_eq!(editor.document.sections().len(), 1);
+        assert_eq!(editor.views[&id].content.plain_text(), "/divider");
+    });
+    cx.update_window(handle, |_, window, cx| window.press("cmd-shift-z", cx))
+        .unwrap();
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.document.sections()),
+        inserted
+    );
+    cx.update_window(handle, |_, window, cx| {
+        select(&editor, &inserted[1].id, 0, 0, 0, window, cx);
+        window.input("After the divider", cx);
+    })
+    .unwrap();
+    editor.read_with(cx, |editor, _| {
+        assert_eq!(
+            editor.document.sections()[1].content.plain_text(),
+            "After the divider"
+        );
+        assert!(editor.error.is_none(), "{:?}", editor.error);
+    });
+}
+
+#[gpui_kit::test]
+fn divider_plus_preserves_text_and_the_divider_can_be_dragged(cx: &mut TestAppContext) {
+    let (handle, editor, id) = setup_content("Hello world\n\nTail", cx);
+    let original = editor.read_with(cx, |editor, _| editor.document.sections());
+    cx.update_window(handle, |_, window, cx| {
+        select(&editor, &id, 0, 0, 5, window, cx);
+        window.render_frame(cx);
+        window.hover(SharedString::from(id.clone()), cx);
+        click_divider_menu(window, cx, 0);
+    })
+    .unwrap();
+    let inserted = editor.read_with(cx, |editor, _| {
+        let sections = editor.document.children(None);
+        assert_eq!(sections.len(), 4);
+        assert_eq!(sections[0], original[0]);
+        assert_eq!(
+            sections[1].content.blocks[0].kind,
+            crate::RichKind::HorizontalRule
+        );
+        assert_eq!(sections[3], original[1]);
+        assert!(editor.error.is_none(), "{:?}", editor.error);
+        sections
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.input("Between", cx);
+    })
+    .unwrap();
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.document.sections()[2]
+            .content
+            .plain_text()),
+        "Between"
+    );
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.hover(SharedString::from(inserted[1].id.clone()), cx);
+        let from = window.find(("grip", 1usize)).bounds().center();
+        let to = window.find("append-section").bounds().center();
+        window.drag(from, to, cx);
+    })
+    .unwrap();
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor
+            .document
+            .children(None)
+            .last()
+            .unwrap()
+            .id
+            .clone()),
+        inserted[1].id
+    );
+    cx.update_window(handle, |_, window, cx| window.press("cmd-z", cx))
+        .unwrap();
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.document.children(None)[1].id.clone()),
+        inserted[1].id
+    );
+}
+
+#[gpui_kit::test]
+fn divider_in_list_and_collapsible_titles_preserves_the_title_and_existing_body(
+    cx: &mut TestAppContext,
+) {
+    for source in [
+        "- Title\n  - Child\n- Other",
+        "<details><summary>Title</summary>\n\nBody\n\n</details>",
+    ] {
+        let (handle, editor, id) = setup_content(source, cx);
+        let original = editor.read_with(cx, |editor, _| editor.document.sections());
+        cx.update_window(handle, |_, window, cx| {
+            select(&editor, &id, 0, 0, 0, window, cx);
+            window.render_frame(cx);
+            window.hover(SharedString::from(id.clone()), cx);
+            click_divider_menu(window, cx, 0);
+        })
+        .unwrap();
+        let continuation = editor.read_with(cx, |editor, _| {
+            let sections = editor.document.sections();
+            for old in &original {
+                assert_eq!(
+                    sections.iter().find(|section| section.id == old.id),
+                    Some(old)
+                );
+            }
+            let children = editor.document.children(Some(&id));
+            assert_eq!(
+                children[0].content.blocks[0].kind,
+                crate::RichKind::HorizontalRule
+            );
+            assert_eq!(
+                children[1].content.blocks[0].kind,
+                crate::RichKind::Paragraph
+            );
+            assert!(!editor.is_collapsed(&id));
+            assert!(editor.error.is_none(), "{:?}", editor.error);
+            children[1].id.clone()
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.input("New body", cx);
+        })
+        .unwrap();
+        assert_eq!(
+            editor.read_with(cx, |editor, _| editor.views[&continuation]
+                .content
+                .plain_text()),
+            "New body"
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn divider_object_selection_clears_on_outside_click_and_focus_changes(cx: &mut TestAppContext) {
+    use markdown_editor::{BlockPosition, BlockSelection};
+
+    for whole_block in [false, true] {
+        for exit in 0..3 {
+            let (handle, editor, id) = setup_content("---\n\nAfter", cx);
+            // Blur observers run only in active platform windows.
+            cx.update_window(handle, |_, window, _| window.activate_window())
+                .unwrap();
+            cx.run_until_parked();
+            let original = editor.read_with(cx, |editor, _| editor.document.sections());
+            let vector = editor.read_with(cx, |editor, _| editor.document.state_vector());
+            let after = original[1].id.clone();
+            let page = cx
+                .update_window(handle, |_, window, cx| {
+                    let native = editor.read(cx).views[&id].editor.clone();
+                    native.update(cx, |state, cx| {
+                        let rule = state
+                            .model()
+                            .document()
+                            .root()
+                            .children()
+                            .next()
+                            .unwrap()
+                            .id();
+                        let selection = if whole_block {
+                            BlockSelection::Blocks {
+                                anchor: rule,
+                                head: rule,
+                            }
+                        } else {
+                            BlockSelection::Text {
+                                anchor: BlockPosition::new(rule, 0),
+                                head: BlockPosition::new(rule, 1),
+                            }
+                        };
+                        state.set_selection(selection, cx).unwrap();
+                        state.focus(window, cx);
+                    });
+                    window.render_frame(cx);
+                    assert!(!native.read(cx).selection().is_collapsed());
+                    let page = editor.read(cx).scroll.offset();
+                    match exit {
+                        0 => window.click(("section-source", 1usize), cx),
+                        1 => {
+                            let blank = window.find("append-section").bounds();
+                            window.click_at(
+                                "append-section",
+                                point(blank.size.width - px(4.), blank.size.height - px(4.)),
+                                cx,
+                            );
+                        }
+                        _ => select(&editor, &after, 0, 5, 5, window, cx),
+                    }
+                    page
+                })
+                .unwrap();
+            // GPUI dispatches blur observers after the focus-changing update.
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| {
+                let native = editor.read(cx).views[&id].editor.clone();
+                window.render_frame(cx);
+                assert!(
+                    native.read(cx).selection().is_collapsed(),
+                    "whole_block={whole_block}, exit={exit}: {:?}",
+                    native.read(cx).selection()
+                );
+                assert!(!native.read(cx).focus_handle(cx).is_focused(window));
+                assert_eq!(editor.read(cx).scroll.offset(), page);
+                assert_eq!(editor.read(cx).document.sections(), original);
+                assert_eq!(editor.read(cx).document.state_vector(), vector);
+            })
+            .unwrap();
+            cx.update_window(handle, |_, window, cx| {
+                if exit == 1 {
+                    window.press("delete", cx);
+                } else {
+                    window.input("!", cx);
+                }
+            })
+            .unwrap();
+            editor.read_with(cx, |editor, _| {
+                assert_eq!(editor.document.sections()[0], original[0]);
+                if exit == 1 {
+                    assert_eq!(editor.document.sections(), original);
+                } else {
+                    assert_eq!(editor.views[&after].content.plain_text(), "After!");
+                }
+                assert!(editor.error.is_none(), "{:?}", editor.error);
+            });
+        }
+    }
 }

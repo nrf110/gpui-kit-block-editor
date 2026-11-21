@@ -571,14 +571,6 @@ impl BlockEditorModel {
         Ok(true)
     }
 
-    /// Whether the caret is in the last row of a table.
-    pub(crate) fn in_last_table_row(&self) -> bool {
-        self.current_cell().is_some_and(|(table, cell)| {
-            cell_coords(&self.doc, table, cell)
-                .is_some_and(|(r, _)| grid(&self.doc, table)[r + 1..].iter().all(Vec::is_empty))
-        })
-    }
-
     /// The table input rule (D13): a paragraph `| a | b |` becomes a table
     /// with those cells as the header row and one empty body row, caret in
     /// its first cell; no alignment. One undo step. Returns `false` when
