@@ -1,0 +1,16 @@
+[workspace]
+repo_url = "https://github.com/nrf110/gpui-kit-block-editor"
+release_always = false
+
+# Bootstrap mode: release PRs work, but release commands have no publish/tag effects.
+# Enable these together only after completing docs/RELEASING.md.
+publish = false
+git_tag_enable = false
+git_release_enable = false
+git_tag_name = "v{{ version }}"
+git_release_type = "auto"
+
+changelog_update = true
+changelog_path = "CHANGELOG.md"
+dependencies_update = false
+semver_check = true

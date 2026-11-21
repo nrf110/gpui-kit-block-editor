@@ -1,0 +1,104 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Release checks
+    uses: ./.github/workflows/ci.yml
+
+  release-pr:
+    name: Prepare release PR
+    needs: checks
+    if: >-
+      github.repository == 'nrf110/gpui-kit-block-editor' &&
+      github.ref == 'refs/heads/main' &&
+      vars.RELEASE_PLZ_APP_ID != ''
+    runs-on: macos-15
+    timeout-minutes: 60
+    concurrency:
+      group: release-pr-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout history
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install repository-pinned Rust toolchain
+        run: rustup show active-toolchain
+      - name: Create repository-scoped App token
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.RELEASE_PLZ_APP_ID }}
+          private-key: ${{ secrets.RELEASE_PLZ_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Prepare version and changelog PR
+        uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.5.148
+        with:
+          command: release-pr
+          version: 0.4.3
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+
+  candidate:
+    name: Identify merged release PR
+    needs: checks
+    if: >-
+      github.repository == 'nrf110/gpui-kit-block-editor' &&
+      github.ref == 'refs/heads/main' &&
+      vars.RELEASE_PUBLISH_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      is-release: ${{ steps.pr.outputs.is-release }}
+    steps:
+      - name: Check PR associated with the tested commit
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          is_release="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" \
+            --jq 'any(.[]; .merged_at != null and .base.ref == "main" and (.head.ref | startswith("release-plz-")))')"
+          echo "is-release=${is_release}" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Publish reviewed release
+    needs: [checks, candidate]
+    # Off until configured; ordinary commits never request environment approval.
+    if: needs.candidate.outputs.is-release == 'true'
+    runs-on: macos-15
+    timeout-minutes: 60
+    environment: release
+    permissions:
+      contents: write
+      pull-requests: read
+      id-token: write
+    steps:
+      - name: Checkout history
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install repository-pinned Rust toolchain
+        run: rustup show active-toolchain
+      - name: Publish merged release PR
+        uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.5.148
+        with:
+          command: release
+          version: 0.4.3
+        env:
+          # release-plz obtains the crates.io token via OIDC when it needs one.
+          GITHUB_TOKEN: ${{ github.token }}
