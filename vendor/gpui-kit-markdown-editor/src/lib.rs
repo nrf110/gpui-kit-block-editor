@@ -43,6 +43,7 @@
 // Resolve existing GPUI paths and macro expansions through the Kit facade.
 extern crate gpui_kit as gpui;
 
+mod code_editor;
 mod command;
 mod cull;
 mod direct;

@@ -66,6 +66,14 @@ A new paragraph below the divider receives focus for continued typing. Dividers 
 
 Divider object selections clear when clicking another block or blank space, or when focus moves elsewhere. Dismissal does not edit shared content or scroll back to the divider; ordinary text selections remain available to formatting controls.
 
+### Code snippets
+
+**/code** uses GPUI Kit's editable **Editor** component: line numbers, syntax highlighting, indentation, horizontal scrolling, and a bounded-height code viewport. Choose a language from the snippet's dropdown; **Plain text** clears the language without removing the code block. Unknown imported language identifiers are retained. The dropdown scrolls independently of the document.
+
+**Enter** inserts a code line; **Tab / Shift+Tab** indents/outdents; **Cmd/Ctrl+Enter** exits to a paragraph below. Backspace in an empty snippet returns it to a paragraph. Up/Down stays within code rows until reaching the block boundary. The existing selection toolbar remains available.
+
+Code still stores the same semantic code node, stable identity, plain text, language, and metadata. Markdown export remains fenced code; native JSON and CRDT storage are unchanged. The code input follows the existing CRDT-relative selections and collaborative undo, including peer edits and IME composition. Mermaid's source view uses the same code editor; its rendered preview is unchanged.
+
 ### Collapsible sections
 
 Type **/collapsible** and press **Enter**, or scroll the **/** menu and click **Collapsible section**. This converts the current block into an editable title and creates an editable child. An empty title becomes `Details`; existing content and descendants are retained. The creator's view expands immediately for editing.

@@ -49,7 +49,12 @@ impl BlockEditor {
     }
 }
 impl RenderOnce for BlockEditor {
-    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        self.state
+            .update(cx, |state, cx| state.sync_code_editor(window, cx));
+        if self.state.read(cx).code_editor_state().is_some() {
+            return crate::BlockEditor::new(&self.state).into_any_element();
+        }
         let scroll = self.state.read(cx).scroll_handle();
         let min_height = rems(self.min_rows as f32 * ROW_HEIGHT + INPUT_PADDING_Y * 2.);
         let max_height = rems(self.max_rows as f32 * ROW_HEIGHT + INPUT_PADDING_Y * 2.);

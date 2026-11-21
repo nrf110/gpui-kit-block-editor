@@ -79,6 +79,11 @@ pub(crate) fn block_role(node: &BlockNode) -> Option<(Role, Option<usize>)> {
 
 impl RenderOnce for BlockEditor {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        self.state
+            .update(cx, |state, cx| state.sync_code_editor(window, cx));
+        if let Some(code) = super::code_editor::render(&self.state, &self.style, window, cx) {
+            return code;
+        }
         let theme = gpui_kit::base::Theme::global(cx);
         // Links are followed by the editor itself (Cmd/Ctrl-click); the shared
         // renderer must never open a URL on its own.
@@ -444,6 +449,7 @@ impl RenderOnce for BlockEditor {
                 snapshot,
                 style,
             })
+            .into_any_element()
     }
 }
 

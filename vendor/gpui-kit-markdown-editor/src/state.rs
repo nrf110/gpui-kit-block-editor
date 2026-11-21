@@ -362,6 +362,9 @@ struct Marked {
 }
 
 pub struct BlockEditorState {
+    /// Opt-in presentation state; the block model remains canonical.
+    pub(crate) code_editor_enabled: bool,
+    pub(crate) code_editor: Option<super::code_editor::CodeEditor>,
     /// Hidden by [`ToggleToolbar`] / [`Self::set_toolbar_hidden`].
     pub(crate) toolbar_hidden: bool,
     pub(crate) model: BlockEditorModel,
@@ -409,8 +412,11 @@ pub struct BlockEditorState {
 impl EventEmitter<BlockEditorEvent> for BlockEditorState {}
 
 impl Focusable for BlockEditorState {
-    fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.focus_handle.clone()
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.code_editor
+            .as_ref()
+            .map(|code| code.input.focus_handle(cx))
+            .unwrap_or_else(|| self.focus_handle.clone())
     }
 }
 
@@ -420,7 +426,7 @@ impl BlockEditorState {
         let focus_handle = cx.focus_handle();
         let blink_cursor = cx.new(|_| BlinkCursor::new());
         // Focus and blink wiring as in `InputBaseState::new_in_mode` (§7.1).
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             cx.observe(&blink_cursor, |_, _, cx| cx.notify()),
             cx.on_focus(&focus_handle, window, |this, _, cx| {
                 this.blink_cursor.update(cx, |b, cx| b.start(cx));
@@ -439,10 +445,15 @@ impl BlockEditorState {
                 }
             }),
         ];
+        subscriptions.push(cx.observe_in(&cx.entity(), window, |this, _, window, cx| {
+            this.sync_code_editor(window, cx);
+        }));
         let model = BlockEditorModel::from_markdown("", MarkdownExtensions::default())
             .unwrap_or_else(|_| unreachable!("empty source always parses"));
         Self {
             model,
+            code_editor_enabled: false,
+            code_editor: None,
             focus_handle,
             blink_cursor,
             style: BlockEditorStyle::default(),
@@ -684,7 +695,7 @@ impl BlockEditorState {
         self.pending_paste = None;
     }
     pub fn is_composing(&self) -> bool {
-        self.marked.is_some()
+        self.marked.is_some() || self.code_editor.as_ref().is_some_and(|code| code.composing)
     }
 
     /// The headless model (document, selection, history).
@@ -709,8 +720,11 @@ impl BlockEditorState {
     /// for a caret, block/cell selection, readonly editor, IME composition,
     /// or a text range with no visible selected glyphs.
     pub fn selection_bounds(&self) -> Option<Bounds<Pixels>> {
-        if self.readonly || self.marked.is_some() {
+        if self.readonly || self.is_composing() {
             return None;
+        }
+        if self.single_code_block().is_some() {
+            return self.code_selection_bounds();
         }
         if !matches!(self.selection(), BlockSelection::Text { .. }) {
             return None;
@@ -781,7 +795,7 @@ impl BlockEditorState {
 
     /// Focus the editor.
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
-        window.focus(&self.focus_handle, cx);
+        window.focus(&self.focus_handle(cx), cx);
     }
 
     fn is_vertical_leaf(&self, block: BlockId) -> bool {
@@ -816,6 +830,9 @@ impl BlockEditorState {
     /// Preferred window-space x when plain Up/Down would leave this editor.
     /// Text ranges and composition remain under native selection handling.
     pub fn vertical_boundary_x(&self, down: bool) -> Option<Pixels> {
+        if self.single_code_block().is_some() {
+            return self.code_vertical_boundary_x(down);
+        }
         if self.marked.is_some() || self.composition_open {
             return None;
         }
@@ -889,6 +906,9 @@ impl BlockEditorState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if let Some(result) = self.code_vertical_entry(down, x, window, cx) {
+            return result;
+        }
         if self.marked.is_some() || self.composition_open {
             return false;
         }
@@ -1070,7 +1090,7 @@ impl BlockEditorState {
 
     // ---- internal edit plumbing -------------------------------------------
 
-    fn after_edit(&mut self, origin: EditOrigin, cx: &mut Context<Self>) {
+    pub(crate) fn after_edit(&mut self, origin: EditOrigin, cx: &mut Context<Self>) {
         self.goal_x = None;
         self.reveal.set(true);
         self.pause_blink(cx);
@@ -1082,7 +1102,7 @@ impl BlockEditorState {
         cx.notify();
     }
 
-    fn selection_changed(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn selection_changed(&mut self, cx: &mut Context<Self>) {
         self.reveal.set(true);
         self.pause_blink(cx);
         cx.emit(BlockEditorEvent::SelectionChanged);

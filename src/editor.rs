@@ -44,6 +44,10 @@ mod media_editor;
 #[path = "block_navigation.rs"]
 mod block_navigation;
 
+#[path = "code_editor.rs"]
+mod code_editor;
+use code_editor::CodeLanguageMenu;
+
 /// Raw Yjs v1 updates. Remote application never echoes a local event.
 #[derive(Clone, Debug)]
 pub enum DocumentEvent {
@@ -268,6 +272,7 @@ pub struct BlockEditor {
     grip_pressed: bool,
     completion: Option<Completion>,
     expanded_diagram: Option<(SectionId, WeakEntity<DiagramViewer>)>,
+    code_language_menu: Option<CodeLanguageMenu>,
     selection_dropdown: Option<SelectionDropdown>,
     selection_link: Option<SelectionLink>,
     selection_toolbar_target: Option<SectionId>,
@@ -352,6 +357,7 @@ impl BlockEditor {
             grip_pressed: false,
             completion: None,
             expanded_diagram: None,
+            code_language_menu: None,
             selection_dropdown: None,
             selection_link: None,
             selection_toolbar_target: None,
@@ -1481,7 +1487,7 @@ impl BlockEditor {
             } else {
                 let mut import_error = None;
                 let editor = cx.new(|cx| {
-                    let mut state = BlockEditorState::new(window, cx);
+                    let mut state = BlockEditorState::new(window, cx).with_code_editor();
                     if let Err(error) = state.set_document(&section.content, cx) {
                         import_error = Some(error.to_string());
                     }
@@ -1575,6 +1581,7 @@ impl BlockEditor {
             self.schedule_preview(&id, cx);
             self.sync_media_view(&id, window, cx);
         }
+        self.reconcile_code_language_menu(window, cx);
         if let Some((index, _)) = focused.filter(|(_, id)| !self.views.contains_key(id)) {
             if let Some(id) = self
                 .order
@@ -1753,6 +1760,18 @@ impl BlockEditor {
         cx: &mut Context<Self>,
     ) {
         let state = editor.read(cx);
+        // Slashes in source code are literal; the + menu remains available.
+        if state.block_kind_at_caret() == Some(NativeBlockKind::CodeBlock) {
+            if self
+                .completion
+                .as_ref()
+                .is_some_and(|menu| menu.section == id)
+            {
+                self.completion = None;
+                cx.notify();
+            }
+            return;
+        }
         let candidate = state.caret_prefix().and_then(|prefix| {
             let slash = prefix.rfind('/')?;
             if slash > 0 && !prefix[..slash].ends_with(char::is_whitespace) {
@@ -2372,6 +2391,8 @@ impl Render for BlockEditor {
             let can_expand = preview.is_some();
             let show_source = !previewable || view.show_source;
             let pending = preview.is_none() && preview_error.is_none();
+            let code_language = code_editor::code_language(&view.content)
+                .map(|language| SharedString::from(language.unwrap_or("Plain text").to_owned()));
             let indent = view.indent;
             let parent = view.parent.clone();
             let marker = view.marker.clone();
@@ -2480,11 +2501,19 @@ impl Render for BlockEditor {
                     .child(media)
                     .when_some(menu, |el, menu| el.child(menu))
             } else if show_source {
-                let source = div()
-                    .id(("section-source", index))
-                    .px_3()
-                    .py_1()
-                    .child(markdown_editor::BlockEditor::new(&editor).min_h(px(24.)));
+                let source =
+                    div().id(("section-source", index)).px_3().py_1().child(
+                        div()
+                            .min_w_0()
+                            .when_some(code_language, |el, language| {
+                                el.bg(cx.theme().muted).rounded_md().child(
+                                    div().flex().justify_end().px_2().py_1().child(
+                                        self.code_language_control(&id, index, language, cx),
+                                    ),
+                                )
+                            })
+                            .child(markdown_editor::BlockEditor::new(&editor).min_h(px(24.))),
+                    );
                 #[cfg(test)]
                 let source = {
                     use gpui_kit::test::TestSupportExt;
@@ -2790,6 +2819,16 @@ impl Render for BlockEditor {
             .size_full()
             .flex()
             .flex_col()
+            .capture_action(cx.listener(
+                |this, _: &gpui_kit::component::input::Undo, window, cx| {
+                    this.code_history_action(false, window, cx);
+                },
+            ))
+            .capture_action(cx.listener(
+                |this, _: &gpui_kit::component::input::Redo, window, cx| {
+                    this.code_history_action(true, window, cx);
+                },
+            ))
             .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, _, _| {
                 if event.button == MouseButton::Left {
                     // The grip's bubbling handler marks only actual grip presses.
@@ -2894,3 +2933,7 @@ mod block_navigation_tests;
 #[cfg(test)]
 #[path = "diagram_editor_tests.rs"]
 mod diagram_editor_tests;
+
+#[cfg(test)]
+#[path = "code_editor_tests.rs"]
+mod code_editor_tests;

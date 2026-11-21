@@ -8,7 +8,7 @@ description = "Collaborative native rich-text block editor for GPUI Kit"
 
 [dependencies]
 anyhow = "1"
-gpui-kit = "0.10.0"
+gpui-kit = { version = "0.10.0", features = ["syntect"] }
 markdown_editor = { package = "gpui-kit-markdown-editor", path = "vendor/gpui-kit-markdown-editor", default-features = false }
 yrs = "0.28.1"
 uuid = { version = "1", features = ["v4"] }
