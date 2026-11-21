@@ -1,7 +1,7 @@
 //! Themed, content-sized Markdown editor. Base retains all editing behavior.
 pub use crate::{
     BlockEditorEvent, BlockEditorState, CapturedRange, CapturedRangeError, ClipboardPolicy,
-    ImagePolicy, PasteRequest, SourceSnapshot, SubmitPolicy,
+    EditorTextStyle, ImagePolicy, PasteRequest, SourceSnapshot, SubmitPolicy,
 };
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -22,6 +22,7 @@ pub struct BlockEditor {
     min_rows: usize,
     max_rows: usize,
     toolbar: bool,
+    presentation: Option<std::sync::Arc<EditorTextStyle>>,
 }
 impl BlockEditor {
     pub fn new(state: &Entity<BlockEditorState>) -> Self {
@@ -30,6 +31,7 @@ impl BlockEditor {
             min_rows: 2,
             max_rows: 16,
             toolbar: false,
+            presentation: None,
         }
     }
     /// Content-sized viewport clamped to content rows plus internal insets. The
@@ -47,13 +49,20 @@ impl BlockEditor {
         self.toolbar = toolbar;
         self
     }
+    /// Forward per-instance native text and code presentation.
+    pub fn presentation(mut self, presentation: std::sync::Arc<EditorTextStyle>) -> Self {
+        self.presentation = Some(presentation);
+        self
+    }
 }
 impl RenderOnce for BlockEditor {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         self.state
             .update(cx, |state, cx| state.sync_code_editor(window, cx));
         if self.state.read(cx).code_editor_state().is_some() {
-            return crate::BlockEditor::new(&self.state).into_any_element();
+            return crate::BlockEditor::new(&self.state)
+                .when_some(self.presentation, |this, style| this.presentation(style))
+                .into_any_element();
         }
         let scroll = self.state.read(cx).scroll_handle();
         let min_height = rems(self.min_rows as f32 * ROW_HEIGHT + INPUT_PADDING_Y * 2.);
@@ -71,6 +80,7 @@ impl RenderOnce for BlockEditor {
             // Padding belongs to the native root, inside the sole scroll owner.
             .child(
                 crate::BlockEditor::new(&self.state)
+                    .when_some(self.presentation, |this, style| this.presentation(style))
                     .min_h(min_height)
                     .px(rems(INPUT_PADDING_X))
                     .py(rems(INPUT_PADDING_Y)),

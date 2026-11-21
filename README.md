@@ -125,9 +125,9 @@ Implement `MediaStore` for other backends. Its blocking operations are dispatche
 Call `gpui_kit::init(cx)` and then `gpui_kit_block_editor::init(cx)` once at startup. Retain the editor entity:
 
 ```rust
-use gpui_kit::{AppContext, Context, Entity, IntoElement, Render, Window};
+use gpui_kit::{AppContext, Context, Entity, IntoElement, Render, Styled, Window};
 use gpui_kit_block_editor::{
-    BlockEditor, BlockSpec, Document, ExtensionRegistry, RichDocument, SectionKind,
+    BlockEditor, BlockEditorView, BlockSpec, Document, ExtensionRegistry, RichDocument, SectionKind,
 };
 
 struct Notes {
@@ -152,7 +152,7 @@ impl Notes {
 
 impl Render for Notes {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        self.editor.clone()
+        BlockEditorView::new(&self.editor).size_full()
     }
 }
 ```
@@ -160,6 +160,52 @@ impl Render for Notes {
 Mount inside a sized GPUI layout using `gpui_kit::open_window`. The component owns its scroll container and uses the host theme; `examples/demo.rs` shows subscriptions and peer routing.
 
 `sections()` returns the projected tree in preorder, including structural groups and folded descendants. `children(parent)` returns direct siblings. `set_content(id, &RichDocument)` applies semantic changes. `move_section()` strictly reorders siblings; `reparent_section()`, `indent_section()`, and `outdent_section()` change nesting. `move_sections(ids, parent, before)` validates a batch before writing, filters duplicates/covered descendants, converts ordinary text/list roles, and groups movement plus empty-container cleanup into one undo step.
+
+### Styling
+
+`BlockEditorView` implements GPUI's `Styled` trait for its outer layout: size, margin, padding, background, borders, and inherited typography. These refinements belong to that mount. Internal presentation belongs to the retained editor: configure `BlockEditor::with_style(EditorStyle)` at construction, or call `set_style(style, cx)` at runtime. `style()` reads the current configuration.
+
+```rust
+use gpui_kit::{StyleRefinement, Styled, px};
+use gpui_kit_block_editor::{EditorStyle, EditorTextStyle};
+
+let mut text = EditorTextStyle::default();
+text.body = StyleRefinement::default()
+    .font_family("Georgia")
+    .text_size(px(17.));
+text.headings[0] = StyleRefinement::default().text_size(px(32.));
+text.code = StyleRefinement::default()
+    .font_family("Menlo")
+    .text_size(px(14.));
+
+let appearance = EditorStyle {
+    document: StyleRefinement::default().p(px(24.)),
+    content: StyleRefinement::default().max_w(px(960.)).gap(px(8.)),
+    controls: StyleRefinement::default().size(px(28.)),
+    drag_handle: StyleRefinement::default().w(px(28.)).h(px(32.)),
+    popup_menu: StyleRefinement::default().min_w(px(220.)).max_h(px(240.)),
+    ..Default::default()
+}.with_text(text);
+
+editor.update(cx, |editor, cx| editor.set_style(appearance, cx));
+```
+
+Unspecified properties follow the current application theme and existing defaults. Overrides refine those defaults rather than replacing an entire theme. `EditorStyle::default()` clears all local overrides. Instances can use different appearances while editing replicas of the same document; `examples/demo.rs` gives the left pane local prose typography and leaves the right pane on theme defaults.
+
+| Configuration | Surface |
+| --- | --- |
+| `document`, `content` | Scroll viewport, readable width, document padding, block spacing |
+| `block`, `selected_block` | Block surfaces and outer block selection |
+| `text` | Body, six heading levels, independent code font, quotes, tables/header/cells, caret and text-selection colors |
+| `controls`, `controls_hover`, `drag_handle`, `drag_handle_hover` | Chrome sizing, typography, and hover appearance |
+| `slash_menu*`, `popup_menu` | Command menu/group/row styles and style/list/language popup surfaces |
+| `selection_toolbar`, `link_editor` | Floating formatting controls and URL editor |
+| `media`, `diagram` | Attachment cards/images and inline diagram previews |
+| `diagram_viewer`, `diagram_toolbar`, `diagram_canvas` | Expanded dialog dimensions/chrome, toolbar, and pan/zoom viewport |
+
+Prose typography does not replace the code editor's monospace defaults; use `text.code` for code-specific overrides. Syntax-token colors and popup checked/disabled/hover state colors continue following the GPUI theme. Code IME underlines follow the code foreground.
+
+Styling is local UI state: it does not write document JSON or CRDT updates, create undo entries, reset code input, or replace attachments. Open menus retain their focus/highlight/scroll; expanded diagrams retain their zoom/pan when restyled. Document formatting commands remain separate from application presentation.
 
 ## Import and export
 

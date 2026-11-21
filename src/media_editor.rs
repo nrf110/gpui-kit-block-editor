@@ -51,7 +51,12 @@ impl BlockEditor {
         }
         view.media = attachment.map(|attachment| {
             let store = self.extensions.media_store.clone();
-            let card = cx.new(|cx| MediaView::new(attachment.clone(), store, window, cx));
+            let style = self.style.clone();
+            let card = cx.new(|cx| {
+                let mut card = MediaView::new(attachment.clone(), store, window, cx);
+                card.set_style(style, cx);
+                card
+            });
             (attachment, card)
         });
     }

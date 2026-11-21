@@ -461,7 +461,6 @@ pub(crate) struct TableShape {
 
 /// Cell box padding and rule widths of gpui-kit's table (`px_3`, `py(7)`,
 /// `border_r_1` between columns, `border_1` frame).
-const CELL_PAD_Y: f32 = 7.;
 const CELL_MIN_WIDTH: f32 = 48.;
 const RULE: f32 = 1.;
 
@@ -481,7 +480,7 @@ impl FrameLayout {
     pub(crate) fn layout_tables(
         &mut self,
         shapes: &[TableShape],
-        pad_x: Pixels,
+        padding: gpui::Edges<Pixels>,
         content_right: Option<Pixels>,
         scale_factor: f32,
     ) {
@@ -506,10 +505,10 @@ impl FrameLayout {
                         let b = leaf.bounds();
                         if elems[c].is_none_or(|(_, w, _, _)| b.size.width > w) {
                             let divider = if c + 1 < cols { px(RULE) } else { px(0.) };
-                            let width =
-                                (b.size.width + pad_x * 2.).max(px(CELL_MIN_WIDTH) - divider);
+                            let width = (b.size.width + padding.left + padding.right)
+                                .max(px(CELL_MIN_WIDTH) - divider);
                             let width = px((f32::from(width) * scale_factor).ceil() / scale_factor);
-                            let inner = width - b.size.width - pad_x * 2.;
+                            let inner = width - b.size.width - padding.left - padding.right;
                             elems[c] = Some((b.left(), b.size.width, width, inner));
                         }
                     }
@@ -531,8 +530,8 @@ impl FrameLayout {
             // Slack per pixel of cell width, from the first informative gap.
             let mut k: Option<f32> = None;
             for c in 0..cols.saturating_sub(1) {
-                let gap = (elems[c + 1].0 - pad_x)
-                    - (elems[c].0 + elems[c].1 + pad_x)
+                let gap = (elems[c + 1].0 - padding.left)
+                    - (elems[c].0 + elems[c].1 + padding.right)
                     - rule
                     - elems[c].3 * share(c).1
                     - elems[c + 1].3 * share(c + 1).0;
@@ -548,7 +547,7 @@ impl FrameLayout {
             {
                 let last = cols - 1;
                 let gap = (right - rule)
-                    - (elems[last].0 + elems[last].1 + pad_x)
+                    - (elems[last].0 + elems[last].1 + padding.right)
                     - elems[last].3 * share(last).1;
                 let denom = share(last).1 * f32::from(cell_w(last));
                 if denom > 0. {
@@ -560,8 +559,8 @@ impl FrameLayout {
                 .map(|c| {
                     let (lead, trail) = share(c);
                     let slack = cell_w(c) * k + elems[c].3;
-                    let left = elems[c].0 - pad_x - slack * lead;
-                    let right = elems[c].0 + elems[c].1 + pad_x + slack * trail;
+                    let left = elems[c].0 - padding.left - slack * lead;
+                    let right = elems[c].0 + elems[c].1 + padding.right + slack * trail;
                     let right = if c + 1 < cols { right + rule } else { right };
                     (left, right)
                 })
@@ -577,7 +576,6 @@ impl FrameLayout {
                     col_spans[c + 1].0 = mid;
                 }
             }
-            let pad_y = px(CELL_PAD_Y);
             let row_spans: Vec<Option<(Pixels, Pixels)>> = shape
                 .grid
                 .iter()
@@ -591,8 +589,8 @@ impl FrameLayout {
                     let bottom = bounds.iter().map(|b| b.bottom()).reduce(|a, b| a.max(b))?;
                     let last = r + 1 == shape.grid.len();
                     Some((
-                        top - pad_y,
-                        bottom + pad_y + if last { px(0.) } else { rule },
+                        top - padding.top,
+                        bottom + padding.bottom + if last { px(0.) } else { rule },
                     ))
                 })
                 .collect();

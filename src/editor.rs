@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     rc::Rc,
     sync::Arc,
@@ -8,11 +8,10 @@ use std::{
 
 use anyhow::Context as _;
 
+use crate::button::EditorButton as Button;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
-    ActiveTheme, Disableable, Icon, IconName, Sizable, StyledExt, WindowExt,
-    button::{Button, ButtonVariants},
-    checkbox::Checkbox,
+    ActiveTheme, Icon, IconName, Sizable, StyledExt, WindowExt, checkbox::Checkbox,
 };
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -24,7 +23,7 @@ use markdown_editor::{
 use yrs::Assoc;
 
 use crate::{
-    Document, SectionId,
+    Document, EditorStyle, SectionId,
     block::{BlockSpec, SectionKind, specs_from_rich},
     block_markdown::parse_blocks,
     diagram_viewer::DiagramViewer,
@@ -191,6 +190,7 @@ struct SectionView {
     preview_task: Option<Task<()>>,
     media: Option<(MediaAttachment, Entity<MediaView>)>,
     navigation_anchor: ScrollAnchor,
+    command_size: Rc<Cell<Size<Pixels>>>,
 }
 
 struct Completion {
@@ -258,6 +258,8 @@ impl Render for DraggedSection {
 /// Construct inside `cx.new`, then mount the resulting entity in any GPUI layout.
 pub struct BlockEditor {
     document: Document,
+    style: Arc<EditorStyle>,
+    quoted_text: Arc<crate::EditorTextStyle>,
     extensions: Arc<ExtensionRegistry>,
     order: Vec<SectionId>,
     views: HashMap<SectionId, SectionView>,
@@ -341,7 +343,10 @@ impl BlockEditor {
                 this.handle_completion_key(&event.keystroke.key, window, cx)
             });
         });
+        let style = Arc::new(EditorStyle::default());
         let mut this = Self {
+            quoted_text: style.text.clone(),
+            style,
             document,
             extensions: Arc::new(extensions),
             order: Vec::new(),
@@ -382,6 +387,33 @@ impl BlockEditor {
         };
         this.reconcile(window, cx);
         this
+    }
+
+    /// Set local appearance while constructing the editor.
+    pub fn with_style(mut self, style: EditorStyle) -> Self {
+        self.quoted_text = style.quoted_text();
+        self.style = Arc::new(style);
+        self
+    }
+
+    /// Current local presentation overrides; never part of the document.
+    pub fn style(&self) -> &EditorStyle {
+        &self.style
+    }
+
+    /// Update appearance without modifying content, selection, or undo history.
+    pub fn set_style(&mut self, style: EditorStyle, cx: &mut Context<Self>) {
+        if self.style.as_ref() == &style {
+            return;
+        }
+        self.quoted_text = style.quoted_text();
+        self.style = Arc::new(style);
+        self.refresh_styled_overlays(cx);
+        cx.notify();
+    }
+
+    pub(super) fn style_button(&self, button: Button) -> Button {
+        button.appearance(self.style.clone())
     }
 
     fn handle_block_key(
@@ -1569,6 +1601,7 @@ impl BlockEditor {
                         preview_task: None,
                         media: None,
                         navigation_anchor: ScrollAnchor::for_handle(self.scroll.clone()),
+                        command_size: Rc::new(Cell::new(size(px(24.), px(28.)))),
                     },
                 );
                 changed.push(section.id);
@@ -1670,19 +1703,28 @@ impl BlockEditor {
         self.selection_dropdown = None;
         self.selection_link = None;
         self.selection_toolbar_target = None;
-        let viewer = cx.new(|cx| DiagramViewer::new(image, window, cx));
+        let viewer = cx.new(|cx| {
+            let mut viewer = DiagramViewer::new(image, window, cx);
+            viewer.set_style(self.style.clone(), cx);
+            viewer
+        });
         self.expanded_diagram = Some((id.to_owned(), viewer.downgrade()));
         let owner = cx.weak_entity();
         let viewer_id = viewer.entity_id();
-        window.open_dialog(cx, move |dialog, window, _| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let viewport = window.viewport_size();
             let viewer = viewer.clone();
+            let appearance = owner.upgrade().map(|owner| owner.read(cx).style.clone());
+            let surface = appearance.as_ref().map(|style| &style.diagram_viewer);
+            let dimensions =
+                crate::style::diagram_dialog_size(surface, viewport, window.rem_size());
             dialog
-                .width((viewport.width - px(48.)).max(px(1.)))
-                .h((viewport.height - px(48.)).max(px(1.)))
+                .width(dimensions.width)
+                .h(dimensions.height)
                 .min_h_0()
                 .centered()
                 .p_0()
+                .when_some(surface, |dialog, style| dialog.refine_style(style))
                 .on_close({
                     let owner = owner.clone();
                     move |_, _, cx| {
@@ -1698,9 +1740,7 @@ impl BlockEditor {
                         });
                     }
                 })
-                .content(move |content, _, _| {
-                    content.p_0().min_h_0().size_full().child(viewer.clone())
-                })
+                .content(move |content, _, _| content.min_h_0().size_full().child(viewer.clone()))
         });
         cx.notify();
     }
@@ -1970,6 +2010,7 @@ impl BlockEditor {
             .text_color(cx.theme().popover_foreground)
             .flex()
             .flex_col()
+            .refine_style(&self.style.slash_menu)
             .child(
                 div()
                     .px_2()
@@ -1996,6 +2037,7 @@ impl BlockEditor {
                     .text_base()
                     .font_semibold()
                     .text_color(cx.theme().popover_foreground)
+                    .refine_style(&self.style.slash_menu_heading)
                     .child(command.group.clone());
                 #[cfg(test)]
                 let heading = {
@@ -2032,6 +2074,8 @@ impl BlockEditor {
                 use gpui_kit::test::TestSupportExt;
                 (icon.test_support(), label.test_support())
             };
+            let appearance = self.style.clone();
+            let accent = cx.theme().accent;
             let row =
                 div()
                     .id(SharedString::from(command.id.clone()))
@@ -2043,8 +2087,15 @@ impl BlockEditor {
                     .flex()
                     .items_center()
                     .gap_3()
-                    .when(index == selected, |el| el.bg(cx.theme().accent))
-                    .hover(|el| el.bg(cx.theme().accent))
+                    .refine_style(&self.style.slash_menu_item)
+                    .when(index == selected, |el| {
+                        el.bg(accent)
+                            .refine_style(&self.style.slash_menu_item_hover)
+                    })
+                    .hover(move |el| {
+                        el.bg(accent)
+                            .refine_style(&appearance.slash_menu_item_hover)
+                    })
                     .cursor_pointer()
                     // Preserve the native capture until the command is accepted.
                     .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
@@ -2379,12 +2430,17 @@ impl Render for BlockEditor {
             .gap_1()
             .w_full()
             .max_w(px(860.))
-            .mx_auto();
+            .mx_auto()
+            .refine_style(&self.style.content);
+        let quote_style_active = self.style.text.quote != StyleRefinement::default();
         for (index, id) in self.order.iter().enumerate() {
             let id = id.clone();
             let view = &self.views[&id];
             let editor = view.editor.clone();
             let media = view.media.as_ref().map(|(_, view)| view.clone());
+            let command_geometry = view.command_size.clone();
+            let command_size = command_geometry.get();
+            let command_geometry_owner = cx.weak_entity();
             let preview = view.preview.clone();
             let preview_error = view.preview_error.clone();
             let previewable = view.previewable;
@@ -2395,6 +2451,18 @@ impl Render for BlockEditor {
                 .map(|language| SharedString::from(language.unwrap_or("Plain text").to_owned()));
             let indent = view.indent;
             let parent = view.parent.clone();
+            let mut quoted = false;
+            if quote_style_active {
+                let mut ancestor = parent.as_deref();
+                while let Some(id) = ancestor {
+                    let Some(node) = self.tree.get(id) else { break };
+                    if node.kind == SectionKind::Quote {
+                        quoted = true;
+                        break;
+                    }
+                    ancestor = node.parent.as_deref();
+                }
+            }
             let marker = view.marker.clone();
             let collapsible = view.kind.default_collapsed().is_some();
             let collapsed = self.is_collapsed(&id);
@@ -2430,6 +2498,7 @@ impl Render for BlockEditor {
                     ));
                 }
             }
+            let grip_appearance = self.style.clone();
             let grip = div()
                 .id(("grip", index))
                 .self_center()
@@ -2443,6 +2512,8 @@ impl Render for BlockEditor {
                 .group_hover("block-section", |style| style.visible())
                 .cursor(CursorStyle::OpenHand)
                 .text_color(cx.theme().muted_foreground)
+                .refine_style(&self.style.drag_handle)
+                .hover(move |style| style.refine_style(&grip_appearance.drag_handle_hover))
                 .child("⠿")
                 .tooltip(|window, cx| {
                     Tooltip::new(
@@ -2512,7 +2583,15 @@ impl Render for BlockEditor {
                                     ),
                                 )
                             })
-                            .child(markdown_editor::BlockEditor::new(&editor).min_h(px(24.))),
+                            .child(
+                                markdown_editor::BlockEditor::new(&editor)
+                                    .presentation(if quoted {
+                                        self.quoted_text.clone()
+                                    } else {
+                                        self.style.text.clone()
+                                    })
+                                    .min_h(px(24.)),
+                            ),
                     );
                 #[cfg(test)]
                 let source = {
@@ -2529,6 +2608,7 @@ impl Render for BlockEditor {
                     .id(("section-preview", index))
                     .p_4()
                     .min_h(px(64.))
+                    .refine_style(&self.style.diagram)
                     .when_some(preview, |el, image| {
                         el.child(
                             img(image)
@@ -2570,8 +2650,11 @@ impl Render for BlockEditor {
                         .pl(px(indent as f32 * 24.))
                         .flex()
                         .items_start()
+                        .refine_style(&self.style.block)
+                        .when(quoted, |row| row.refine_style(&self.style.text.quote))
                         .when(self.block_is_selected(&id), |row| {
                             row.bg(cx.theme().secondary)
+                                .refine_style(&self.style.selected_block)
                         }),
                     DropTarget {
                         parent,
@@ -2583,8 +2666,8 @@ impl Render for BlockEditor {
                     div()
                         .relative()
                         .self_center()
-                        .w(px(24.))
-                        .h(px(28.))
+                        .min_w(px(24.))
+                        .min_h(px(28.))
                         .flex_shrink_0()
                         .flex()
                         .items_center()
@@ -2595,7 +2678,7 @@ impl Render for BlockEditor {
                                 .invisible()
                                 .group_hover("block-section", |style| style.visible())
                                 .child(
-                                    Button::new(("block-menu", index))
+                                    self.style_button(Button::new(("block-menu", index)))
                                         .ghost()
                                         .small()
                                         .icon(IconName::Plus)
@@ -2606,6 +2689,21 @@ impl Render for BlockEditor {
                                         })),
                                 ),
                         )
+                        .child(
+                            canvas(
+                                move |bounds, _, cx| {
+                                    if command_geometry.replace(bounds.size) != bounds.size {
+                                        let owner = command_geometry_owner.clone();
+                                        cx.defer(move |cx| {
+                                            let _ = owner.update(cx, |_, cx| cx.notify());
+                                        });
+                                    }
+                                },
+                                |_, _, _, _| {},
+                            )
+                            .absolute()
+                            .inset_0(),
+                        )
                         .when_some(button_menu, |el, menu| {
                             el.child(
                                 div().absolute().top_0().left_0().child(
@@ -2614,10 +2712,7 @@ impl Render for BlockEditor {
                                             .anchor(Anchor::TopLeft)
                                             .position_mode(AnchoredPositionMode::Local)
                                             .attach(
-                                                Bounds::new(
-                                                    point(px(0.), px(0.)),
-                                                    size(px(24.), px(28.)),
-                                                ),
+                                                Bounds::new(point(px(0.), px(0.)), command_size),
                                                 Anchor::BottomLeft,
                                             )
                                             .offset(point(px(0.), px(4.)))
@@ -2631,7 +2726,7 @@ impl Render for BlockEditor {
                 .child(grip)
                 .when(collapsible, |row| {
                     row.child(
-                        Button::new(("toggle-collapse", index))
+                        self.style_button(Button::new(("toggle-collapse", index)))
                             .ghost()
                             .small()
                             .icon(if collapsed {
@@ -2689,7 +2784,7 @@ impl Render for BlockEditor {
                 .child(
                     div()
                         .mt_2()
-                        .w(px(if previewable { 92. } else { 60. }))
+                        .min_w(px(if previewable { 92. } else { 60. }))
                         .flex()
                         .items_center()
                         .justify_end()
@@ -2699,7 +2794,7 @@ impl Render for BlockEditor {
                         .group_hover("block-section", |style| style.visible())
                         .when(previewable, |el| {
                             el.child(
-                                Button::new(("expand-preview", index))
+                                self.style_button(Button::new(("expand-preview", index)))
                                     .ghost()
                                     .small()
                                     .icon(IconName::Maximize)
@@ -2711,7 +2806,7 @@ impl Render for BlockEditor {
                                     })),
                             )
                             .child(
-                                Button::new(("toggle-preview", index))
+                                self.style_button(Button::new(("toggle-preview", index)))
                                     .ghost()
                                     .small()
                                     .icon(if show_source {
@@ -2735,7 +2830,7 @@ impl Render for BlockEditor {
                             )
                         })
                         .child(
-                            Button::new(("remove", index))
+                            self.style_button(Button::new(("remove", index)))
                                 .ghost()
                                 .small()
                                 .icon(self.trash_icon.clone())
@@ -2787,7 +2882,7 @@ impl Render for BlockEditor {
                 cx,
             )
                 .child(
-                    Button::new("add-section")
+                    self.style_button(Button::new("add-section"))
                         .label("+ Add block")
                         .on_click(cx.listener(|this, _, window, cx| {
                             match this.insert_section(None, "", window, cx) {
@@ -2869,6 +2964,7 @@ impl Render for BlockEditor {
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll)
                     .p_5()
+                    .refine_style(&self.style.document)
                     .can_drop(|value, _, _| value.downcast_ref::<ExternalPaths>().is_some())
                     .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                         cx.stop_propagation();
@@ -2937,3 +3033,11 @@ mod diagram_editor_tests;
 #[cfg(test)]
 #[path = "code_editor_tests.rs"]
 mod code_editor_tests;
+
+#[cfg(test)]
+#[path = "style_tests.rs"]
+mod style_tests;
+
+#[cfg(test)]
+#[path = "overlay_style_tests.rs"]
+mod overlay_style_tests;

@@ -1,9 +1,8 @@
 use std::sync::Arc;
 
-use gpui_kit::component::{
-    ActiveTheme, Disableable, Sizable, StyledExt,
-    button::{Button, ButtonVariants},
-};
+use crate::EditorStyle;
+use crate::button::EditorButton as Button;
+use gpui_kit::component::{ActiveTheme, StyledExt};
 use gpui_kit::*;
 
 const MIN_ZOOM: f32 = 0.25;
@@ -45,6 +44,7 @@ pub(crate) struct DiagramViewer {
     zoom: f32,
     pan: Point<Pixels>,
     drag_position: Option<Point<Pixels>>,
+    style: Arc<EditorStyle>,
 }
 
 impl DiagramViewer {
@@ -64,9 +64,21 @@ impl DiagramViewer {
             zoom: 1.,
             pan: point(px(0.), px(0.)),
             drag_position: None,
+            style: Arc::new(EditorStyle::default()),
         };
         viewer.set_preview(Some(image), None, cx);
         viewer
+    }
+
+    pub(crate) fn set_style(&mut self, style: Arc<EditorStyle>, cx: &mut Context<Self>) {
+        self.style = style;
+        // Geometry is measured during prepaint. Only a changed viewport requests
+        // another raster; changing colors must not reset the camera or source.
+        cx.notify();
+    }
+
+    fn style_button(&self, button: Button) -> Button {
+        button.appearance(self.style.clone())
     }
 
     pub(crate) fn set_preview(
@@ -264,6 +276,7 @@ impl Render for DiagramViewer {
             zoom_label.test_support()
         };
         let header = div()
+            .id("diagram-toolbar")
             .h(px(48.))
             .flex_shrink_0()
             .flex()
@@ -274,6 +287,7 @@ impl Render for DiagramViewer {
             .pr(px(52.))
             .border_b_1()
             .border_color(cx.theme().border)
+            .refine_style(&self.style.diagram_toolbar)
             .child(
                 div()
                     .flex_1()
@@ -283,42 +297,53 @@ impl Render for DiagramViewer {
                     .child("Diagram"),
             )
             .child(
-                Button::new("diagram-zoom-out")
-                    .ghost()
-                    .small()
-                    .label("−")
-                    .tooltip("Zoom out")
-                    .disabled(!ready || self.zoom <= MIN_ZOOM)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.zoom_at(this.zoom / ZOOM_STEP, this.viewport.center(), cx);
-                    })),
+                self.style_button(
+                    Button::new("diagram-zoom-out")
+                        .ghost()
+                        .small()
+                        .label("−")
+                        .tooltip("Zoom out")
+                        .disabled(!ready || self.zoom <= MIN_ZOOM)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.zoom_at(this.zoom / ZOOM_STEP, this.viewport.center(), cx);
+                        })),
+                ),
             )
             .child(zoom_label)
             .child(
-                Button::new("diagram-zoom-in")
-                    .ghost()
-                    .small()
-                    .label("+")
-                    .tooltip("Zoom in")
-                    .disabled(!ready || self.zoom >= MAX_ZOOM)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.zoom_at(this.zoom * ZOOM_STEP, this.viewport.center(), cx);
-                    })),
+                self.style_button(
+                    Button::new("diagram-zoom-in")
+                        .ghost()
+                        .small()
+                        .label("+")
+                        .tooltip("Zoom in")
+                        .disabled(!ready || self.zoom >= MAX_ZOOM)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.zoom_at(this.zoom * ZOOM_STEP, this.viewport.center(), cx);
+                        })),
+                ),
             )
             .child(
-                Button::new("diagram-fit")
-                    .ghost()
-                    .small()
-                    .label("Fit")
-                    .tooltip("Fit diagram to window")
-                    .disabled(!ready)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.fit(cx);
-                    })),
+                self.style_button(
+                    Button::new("diagram-fit")
+                        .ghost()
+                        .small()
+                        .label("Fit")
+                        .tooltip("Fit diagram to window")
+                        .disabled(!ready)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.fit(cx);
+                        })),
+                ),
             );
+        #[cfg(test)]
+        let header = {
+            use gpui_kit::test::TestSupportExt;
+            header.test_support()
+        };
         let geometry_owner = cx.weak_entity();
         let pointer_owner = cx.weak_entity();
         let mut viewport = div()
@@ -329,6 +354,7 @@ impl Render for DiagramViewer {
             .w_full()
             .overflow_hidden()
             .bg(cx.theme().muted)
+            .refine_style(&self.style.diagram_canvas)
             .cursor(if self.drag_position.is_some() {
                 CursorStyle::ClosedHand
             } else {
@@ -464,7 +490,6 @@ impl Render for DiagramViewer {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .bg(cx.theme().background)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_scroll(|_, window, cx| {

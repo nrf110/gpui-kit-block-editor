@@ -88,9 +88,10 @@ impl BlockEditorState {
         };
         // A new entity fences all already-queued events from the previous external
         // document. In particular a late IME/full-buffer event cannot restore peers' text.
-        let replace = self.code_editor.as_ref().is_none_or(|code| {
-            code.reload || (code.revision != revision && code.text != text)
-        });
+        let replace = self
+            .code_editor
+            .as_ref()
+            .is_none_or(|code| code.reload || (code.revision != revision && code.text != text));
         if replace {
             let old = self.code_editor.take();
             let focused = old
@@ -493,12 +494,14 @@ fn grapheme_diff<'a>(old: &str, new: &'a str) -> (std::ops::Range<usize>, &'a st
 pub(crate) fn render(
     state: &Entity<BlockEditorState>,
     style: &gpui::StyleRefinement,
-    _window: &mut Window,
+    presentation: Option<&crate::EditorTextStyle>,
+    window: &mut Window,
     cx: &mut App,
 ) -> Option<gpui::AnyElement> {
+    use gpui::prelude::FluentBuilder as _;
     use gpui::{
-        InteractiveElement as _, IntoElement as _, ParentElement as _, Styled as _, canvas, div,
-        rems,
+        InteractiveElement as _, IntoElement as _, ParentElement as _, Refineable as _,
+        Styled as _, canvas, div, relative,
     };
     use gpui_kit::base::StyledExt as _;
     use gpui_kit::component::input;
@@ -520,6 +523,60 @@ pub(crate) fn render(
     let cut = state.clone();
     let backspace = state.clone();
     let delete = state.clone();
+    // Editor's own Styled refinement reaches the real Input, after its mono
+    // defaults. An inherited wrapper font alone cannot override those defaults.
+    let mut code_style = gpui::StyleRefinement::default();
+    code_style.text = style.text.clone();
+    if let Some(presentation) = presentation {
+        // Prose typography must not replace the code editor's mono defaults.
+        if let Some(color) = presentation.body.text.color {
+            code_style.text.color = Some(color);
+        }
+        code_style.refine(&presentation.code);
+    }
+    use gpui_kit::component::ActiveTheme as _;
+    let theme = cx.theme();
+    let mut typography = window.text_style();
+    typography.font_family = theme.mono_font_family.clone();
+    typography.font_size = theme.mono_font_size.into();
+    typography.line_height = relative(1.5);
+    typography.refine(&code_style.text);
+    let height =
+        typography.line_height_in_pixels(window.rem_size()) * rows as f32 + window.rem_size();
+    let colors = presentation.map(|presentation| {
+        let background = code_style
+            .background
+            .as_ref()
+            .and_then(|bg| bg.color())
+            .and_then(|bg| bg.as_solid());
+        gpui_kit::base::input::InputEditorStyle {
+            foreground: code_style.text.color.unwrap_or(theme.foreground),
+            muted_foreground: theme.muted_foreground,
+            background: background.unwrap_or_else(|| {
+                theme
+                    .highlight_theme
+                    .style
+                    .editor_background
+                    .unwrap_or_else(|| theme.input_background())
+            }),
+            border: theme.border,
+            selection: presentation.selection.unwrap_or(theme.selection),
+            caret: presentation.caret.unwrap_or(theme.caret),
+            diagnostics: gpui_kit::base::input::DiagnosticColors {
+                error: theme.highlight_theme.style.status.error(cx),
+                warning: theme.highlight_theme.style.status.warning(cx),
+                info: theme.highlight_theme.style.status.info(cx),
+                hint: theme.highlight_theme.style.status.hint(cx),
+            },
+            highlight_styles: theme.highlight_theme.clone(),
+            editor_invisible: theme.highlight_theme.style.editor_invisible,
+            editor_active_line: theme.highlight_theme.style.editor_active_line,
+            editor_gutter_background: background
+                .or(theme.highlight_theme.style.editor_gutter_background),
+            // This editor explicitly disables source folding at construction.
+            fold_icon_renderer: None,
+        }
+    });
     Some(
         div()
             .id("code-input")
@@ -527,6 +584,9 @@ pub(crate) fn render(
             .w_full()
             .min_w_0()
             .refine_style(style)
+            .when_some(presentation, |this, presentation| {
+                this.refine_style(&presentation.body)
+            })
             // Hosts can capture one level earlier to use collaborative history.
             .capture_action(move |_: &input::Undo, _, cx| {
                 undo.update(cx, |state, cx| {
@@ -618,14 +678,20 @@ pub(crate) fn render(
                     cx.stop_propagation();
                 }
             })
-            .child(
-                input::Editor::new(&input)
-                    .aria_label("Code")
-                    .readonly(readonly)
-                    .h(rems(rows as f32 * 1.5 + 1.))
-                    .appearance(false)
-                    .bordered(false),
-            )
+            .child(CodePresentation {
+                input: input.clone(),
+                colors,
+                child: Some(
+                    input::Editor::new(&input)
+                        .aria_label("Code")
+                        .readonly(readonly)
+                        .h(height)
+                        .appearance(false)
+                        .bordered(false)
+                        .refine_style(&code_style)
+                        .into_any_element(),
+                ),
+            })
             // A passive cache only: painting never mutates an entity or selection.
             .child(
                 canvas(
@@ -683,6 +749,78 @@ pub(crate) fn render(
             )
             .into_any_element(),
     )
+}
+
+/// The component projects its theme during request_layout, before the native
+/// input shapes glyphs in prepaint. Project local colors after that render so
+/// it cannot overwrite them. No text, selection, history or paint-time entity
+/// mutation is involved. GPUI's IME underline follows the actual foreground.
+struct CodePresentation {
+    input: Entity<EditorState>,
+    colors: Option<gpui_kit::base::input::InputEditorStyle>,
+    child: Option<gpui::AnyElement>,
+}
+
+impl gpui::IntoElement for CodePresentation {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl gpui::Element for CodePresentation {
+    type RequestLayoutState = gpui::AnyElement;
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
+        let mut child = self.child.take().expect("code presentation lays out once");
+        let layout = child.request_layout(window, cx);
+        if let Some(colors) = self.colors.take() {
+            self.input
+                .update(cx, |input, _| input.set_editor_style(colors));
+        }
+        (layout, child)
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        _: Bounds<Pixels>,
+        child: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        child.prepaint(window, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        _: Bounds<Pixels>,
+        child: &mut Self::RequestLayoutState,
+        _: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        child.paint(window, cx);
+    }
 }
 
 fn visible_selection_bounds(input: &EditorState, mask: Bounds<Pixels>) -> Option<Bounds<Pixels>> {

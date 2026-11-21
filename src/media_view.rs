@@ -6,12 +6,11 @@ use std::{
 };
 
 use anyhow::{Context as _, bail};
-use gpui_kit::component::{
-    ActiveTheme, Disableable, Icon, IconName, Sizable,
-    button::{Button, ButtonVariants},
-};
+use gpui_kit::component::{ActiveTheme, Icon, IconName, StyledExt};
 use gpui_kit::*;
 
+use crate::EditorStyle;
+use crate::button::EditorButton as Button;
 use crate::media::{MediaAttachment, MediaKind, MediaStore};
 
 enum LocalAsset {
@@ -33,6 +32,7 @@ pub(super) struct MediaView {
     busy: bool,
     resolve_task: Option<Task<()>>,
     action_task: Option<Task<()>>,
+    style: Arc<EditorStyle>,
 }
 
 impl MediaView {
@@ -64,9 +64,19 @@ impl MediaView {
             busy: false,
             resolve_task: None,
             action_task: None,
+            style: Arc::new(EditorStyle::default()),
         };
         view.resolve(window, cx);
         view
+    }
+
+    pub(crate) fn set_style(&mut self, style: Arc<EditorStyle>, cx: &mut Context<Self>) {
+        self.style = style;
+        cx.notify();
+    }
+
+    fn style_button(&self, button: Button) -> Button {
+        button.appearance(self.style.clone())
     }
 
     fn replace_path(&mut self, path: Arc<Path>, window: &mut Window, cx: &mut Context<Self>) {
@@ -206,7 +216,8 @@ impl Render for MediaView {
             .rounded_md()
             .border_1()
             .border_color(cx.theme().border)
-            .bg(cx.theme().background);
+            .bg(cx.theme().background)
+            .refine_style(&self.style.media);
         if self.attachment.kind == MediaKind::Image
             && let LocalAsset::Ready(path) = &self.local
         {
@@ -286,38 +297,48 @@ impl Render for MediaView {
                         .items_center()
                         .gap_1()
                         .child(
-                            Button::new("media-open")
-                                .ghost()
-                                .small()
-                                .icon(IconName::ExternalLink)
-                                .label("Open")
-                                .accessibility_label("Open attachment in system app")
-                                .tooltip(open_tooltip)
-                                .disabled(!ready || !self.open_allowed || self.busy)
-                                .on_click(cx.listener(|this, _, window, cx| this.open(window, cx))),
+                            self.style_button(
+                                Button::new("media-open")
+                                    .ghost()
+                                    .small()
+                                    .icon(IconName::ExternalLink)
+                                    .label("Open")
+                                    .accessibility_label("Open attachment in system app")
+                                    .tooltip(open_tooltip)
+                                    .disabled(!ready || !self.open_allowed || self.busy)
+                                    .on_click(
+                                        cx.listener(|this, _, window, cx| this.open(window, cx)),
+                                    ),
+                            ),
                         )
                         .child(
-                            Button::new("media-save")
-                                .ghost()
-                                .small()
-                                .icon(IconName::ArrowDown)
-                                .label("Save")
-                                .accessibility_label("Save attachment as a file")
-                                .tooltip("Save a copy…")
-                                .disabled(!ready || self.busy)
-                                .on_click(cx.listener(|this, _, window, cx| this.save(window, cx))),
+                            self.style_button(
+                                Button::new("media-save")
+                                    .ghost()
+                                    .small()
+                                    .icon(IconName::ArrowDown)
+                                    .label("Save")
+                                    .accessibility_label("Save attachment as a file")
+                                    .tooltip("Save a copy…")
+                                    .disabled(!ready || self.busy)
+                                    .on_click(
+                                        cx.listener(|this, _, window, cx| this.save(window, cx)),
+                                    ),
+                            ),
                         )
                         .child(
-                            Button::new("media-retry")
-                                .ghost()
-                                .small()
-                                .icon(IconName::RefreshCw)
-                                .accessibility_label("Retry loading attachment")
-                                .tooltip("Retry loading attachment")
-                                .disabled(loading || self.busy)
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| this.resolve(window, cx)),
-                                ),
+                            self.style_button(
+                                Button::new("media-retry")
+                                    .ghost()
+                                    .small()
+                                    .icon(IconName::RefreshCw)
+                                    .accessibility_label("Retry loading attachment")
+                                    .tooltip("Retry loading attachment")
+                                    .disabled(loading || self.busy)
+                                    .on_click(
+                                        cx.listener(|this, _, window, cx| this.resolve(window, cx)),
+                                    ),
+                            ),
                         ),
                 ),
         );

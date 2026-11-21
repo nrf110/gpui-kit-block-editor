@@ -8,7 +8,7 @@
 //! then paints the caret and the composition underline from that geometry.
 //! Paint never updates the editor entity.
 
-use std::{cell::Cell, collections::HashMap, ops::Range, rc::Rc};
+use std::{cell::Cell, collections::HashMap, ops::Range, rc::Rc, sync::Arc};
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -36,6 +36,7 @@ const LIST_CHUNK: usize = 32;
 pub struct BlockEditor {
     state: Entity<BlockEditorState>,
     style: StyleRefinement,
+    presentation: Option<Arc<crate::EditorTextStyle>>,
 }
 
 impl BlockEditor {
@@ -43,7 +44,14 @@ impl BlockEditor {
         Self {
             state: state.clone(),
             style: StyleRefinement::default(),
+            presentation: None,
         }
+    }
+
+    /// Override this view's appearance without changing the retained document.
+    pub fn presentation(mut self, presentation: Arc<crate::EditorTextStyle>) -> Self {
+        self.presentation = Some(presentation);
+        self
     }
 }
 
@@ -81,16 +89,48 @@ impl RenderOnce for BlockEditor {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         self.state
             .update(cx, |state, cx| state.sync_code_editor(window, cx));
-        if let Some(code) = super::code_editor::render(&self.state, &self.style, window, cx) {
+        if let Some(code) = super::code_editor::render(
+            &self.state,
+            &self.style,
+            self.presentation.as_deref(),
+            window,
+            cx,
+        ) {
             return code;
         }
         let theme = gpui_kit::base::Theme::global(cx);
         // Links are followed by the editor itself (Cmd/Ctrl-click); the shared
         // renderer must never open a URL on its own.
         let render_cx = RenderContext::from_app(cx).on_link_click(|_, _, _, _| {});
-        let text_style = render_cx.style().clone();
+        let (text_style, presentation_changed) = self
+            .state
+            .read(cx)
+            .presentation
+            .borrow_mut()
+            .resolve(self.presentation.as_ref(), render_cx.style());
+        if presentation_changed {
+            self.state
+                .read(cx)
+                .cull
+                .borrow_mut()
+                .invalidate_measurements();
+        }
+        let render_cx = render_cx.with_style(text_style.clone());
         let mut style = self.state.read(cx).style.resolved(&theme.tokens);
-        if style.selection_is_default() {
+        if let Some(presentation) = &self.presentation {
+            if let Some(color) = presentation.caret {
+                style = style.with_caret(color);
+            }
+            if let Some(color) = presentation.selection {
+                style = style.with_selection(color);
+            }
+        }
+        if style.selection_is_default()
+            && self
+                .presentation
+                .as_ref()
+                .is_none_or(|presentation| presentation.selection.is_none())
+        {
             style = style.with_selection(text_style.selection());
         }
         // Read the prior frame before request_layout can reset shared text
@@ -151,8 +191,12 @@ impl RenderOnce for BlockEditor {
 
         // Match the native root's effective inherited/instance typography
         // before deriving body-relative node metrics and culling geometry.
+        let mut root_refinement = self.style;
+        if let Some(presentation) = &self.presentation {
+            root_refinement.refine(&presentation.body);
+        }
         let mut typography = window.text_style();
-        typography.refine(&self.style.text);
+        typography.refine(&root_refinement.text);
         let node_cx = render_cx
             .with_markdown_extensions(extensions)
             .with_body_font_size(typography.font_size.to_pixels(window.rem_size()));
@@ -335,7 +379,15 @@ impl RenderOnce for BlockEditor {
         let content_bounds = Rc::new(Cell::new(Bounds::default()));
         let measured_content = content_bounds.clone();
         let mut root_style = Style::default();
-        root_style.refine(&self.style);
+        root_style.refine(&root_refinement);
+        let mut table_style = Style::default();
+        table_style.padding = Edges {
+            top: px(7.).into(),
+            right: gpui::rems(0.75).into(),
+            bottom: px(7.).into(),
+            left: gpui::rems(0.75).into(),
+        };
+        table_style.refine(text_style.table_cell());
         let s = &self.state;
         div()
             .id("block-editor")
@@ -426,7 +478,7 @@ impl RenderOnce for BlockEditor {
                 child: Some(
                     div()
                         .w_full()
-                        .refine_style(&self.style)
+                        .refine_style(&root_refinement)
                         .child(
                             div().relative().w_full().children(children).child(
                                 canvas(
@@ -443,6 +495,7 @@ impl RenderOnce for BlockEditor {
                 ),
                 content_bounds,
                 padding: root_style.padding,
+                table_padding: table_style.padding,
                 typography,
                 caret_was_visible,
                 backgrounds: Some(backgrounds),
@@ -463,6 +516,7 @@ struct EditorRoot {
     style: BlockEditorStyle,
     content_bounds: Rc<Cell<Bounds<Pixels>>>,
     padding: Edges<DefiniteLength>,
+    table_padding: Edges<DefiniteLength>,
     typography: TextStyle,
     caret_was_visible: bool,
 }
@@ -582,8 +636,9 @@ impl Element for EditorRoot {
                         },
                     })
                     .collect();
-                // gpui-kit's cell padding is `px_3`: 0.75rem.
-                let pad = window.rem_size() * 0.75;
+                let pad = self
+                    .table_padding
+                    .to_pixels(bounds.size.map(Into::into), window.rem_size());
                 let right = frame.content.map(|c| c.right());
                 frame.layout_tables(&shapes, pad, right, window.scale_factor());
             }

@@ -1,12 +1,10 @@
 use super::*;
-use gpui_kit::component::{
-    menu::{PopupMenu, PopupMenuItem},
-    popover::Popover,
-};
+use crate::popup_menu::{EditorPopupItem, EditorPopupMenu};
+use gpui_kit::component::popover::Popover;
 
 pub(super) struct CodeLanguageMenu {
     section: SectionId,
-    menu: Entity<PopupMenu>,
+    menu: Entity<EditorPopupMenu>,
     _subscription: Subscription,
 }
 
@@ -45,6 +43,13 @@ pub(super) fn code_language(content: &RichDocument) -> Option<Option<&str>> {
 }
 
 impl BlockEditor {
+    pub(super) fn refresh_code_language_style(&mut self, cx: &mut Context<Self>) {
+        if let Some(menu) = &self.code_language_menu {
+            let style = self.style.popup_menu.clone();
+            menu.menu.update(cx, |menu, cx| menu.set_style(style, cx));
+        }
+    }
+
     pub(super) fn code_history_action(
         &mut self,
         redo: bool,
@@ -129,51 +134,51 @@ impl BlockEditor {
         self.selection_link = None;
         let owner = cx.weak_entity();
         let section: Arc<str> = Arc::from(id);
-        let menu = PopupMenu::build(window, cx, move |mut menu, _, _| {
-            menu = menu.min_w(px(180.)).max_h(px(260.)).scrollable(true);
-            for &(label, language) in LANGUAGES {
-                let owner = owner.clone();
-                let section = section.clone();
-                menu = menu.item(
-                    PopupMenuItem::new(label)
-                        .checked(current.as_deref() == language)
-                        .on_click(move |_, window, cx| {
-                            let _ = owner.update(cx, |this, cx| {
-                                this.code_language_menu = None;
-                                // A peer may have removed or converted the block while the menu was open.
-                                if !this
-                                    .views
-                                    .get(section.as_ref())
-                                    .is_some_and(|view| code_language(&view.content).is_some())
-                                {
-                                    cx.notify();
-                                    return;
-                                }
-                                let editor = this.views[section.as_ref()].editor.clone();
-                                let selection = editor.read(cx).selection().clone();
-                                this.views.get_mut(section.as_ref()).unwrap().show_source = true;
-                                this.execute_command(
-                                    &section,
-                                    CommandAction::Editor(EditorCommand::SetCodeBlock {
-                                        lang: language.map(str::to_owned),
-                                    }),
-                                    None,
-                                    window,
-                                    cx,
-                                );
-                                // A language change isn't a selection change.
-                                if let Err(error) = editor
-                                    .update(cx, |state, cx| state.set_selection(selection, cx))
-                                {
-                                    this.error = Some(format!("{error:?}"));
-                                    cx.notify();
-                                }
-                            });
-                        }),
-                );
-            }
-            menu
-        });
+        let mut items = Vec::with_capacity(LANGUAGES.len());
+        for &(label, language) in LANGUAGES {
+            let owner = owner.clone();
+            let section = section.clone();
+            items.push(EditorPopupItem::new(
+                label,
+                current.as_deref() == language,
+                false,
+                move |_, window, cx| {
+                    let _ = owner.update(cx, |this, cx| {
+                        this.code_language_menu = None;
+                        // A peer may have removed or converted the block while the menu was open.
+                        if !this
+                            .views
+                            .get(section.as_ref())
+                            .is_some_and(|view| code_language(&view.content).is_some())
+                        {
+                            cx.notify();
+                            return;
+                        }
+                        let editor = this.views[section.as_ref()].editor.clone();
+                        let selection = editor.read(cx).selection().clone();
+                        this.views.get_mut(section.as_ref()).unwrap().show_source = true;
+                        this.execute_command(
+                            &section,
+                            CommandAction::Editor(EditorCommand::SetCodeBlock {
+                                lang: language.map(str::to_owned),
+                            }),
+                            None,
+                            window,
+                            cx,
+                        );
+                        // A language change isn't a selection change.
+                        if let Err(error) =
+                            editor.update(cx, |state, cx| state.set_selection(selection, cx))
+                        {
+                            this.error = Some(format!("{error:?}"));
+                            cx.notify();
+                        }
+                    });
+                },
+            ));
+        }
+        let style = self.style.popup_menu.clone();
+        let menu = cx.new(|cx| EditorPopupMenu::new(items, px(260.), style, cx));
         let subscription =
             cx.subscribe_in(&menu, window, |this, menu, _: &DismissEvent, window, cx| {
                 let id = this
@@ -213,14 +218,16 @@ impl BlockEditor {
             .overlay_closable(false)
             .anchor(Anchor::TopLeft)
             .trigger(
-                Button::new(("code-language", index))
-                    .ghost()
-                    .small()
-                    .icon(IconName::SquareTerminal)
-                    .label(language)
-                    .dropdown_caret(true)
-                    .accessibility_label("Code language")
-                    .tooltip("Code language"),
+                self.style_button(
+                    Button::new(("code-language", index))
+                        .ghost()
+                        .small()
+                        .icon(IconName::SquareTerminal)
+                        .label(language)
+                        .dropdown_caret(true)
+                        .accessibility_label("Code language")
+                        .tooltip("Code language"),
+                ),
             )
             .open(open)
             .on_open_change(cx.listener(move |this, open, window, cx| {

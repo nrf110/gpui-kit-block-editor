@@ -1,10 +1,8 @@
 use super::*;
+use crate::popup_menu::{EditorPopupItem, EditorPopupMenu};
 use gpui_kit::component::toolbar::Toolbar;
 use gpui_kit::component::{
-    Disableable,
-    button::{Toggle, ToggleVariants},
     input::{Input, InputEvent, InputState},
-    menu::{PopupMenu, PopupMenuItem},
     popover::Popover,
 };
 use markdown_editor::{MarkChange, MarkKind, MarkState};
@@ -18,7 +16,7 @@ pub(super) enum SelectionPanel {
 pub(super) struct SelectionDropdown {
     section: SectionId,
     kind: SelectionPanel,
-    menu: Entity<PopupMenu>,
+    menu: Entity<EditorPopupMenu>,
     _subscription: Subscription,
 }
 
@@ -136,6 +134,30 @@ fn safe_link(url: &str) -> bool {
 }
 
 impl BlockEditor {
+    pub(super) fn refresh_styled_overlays(&mut self, cx: &mut Context<Self>) {
+        if let Some(dropdown) = &self.selection_dropdown {
+            let style = self.style.popup_menu.clone();
+            dropdown
+                .menu
+                .update(cx, |menu, cx| menu.set_style(style, cx));
+        }
+        self.refresh_code_language_style(cx);
+        for view in self.views.values() {
+            if let Some((_, media)) = &view.media {
+                let style = self.style.clone();
+                media.update(cx, |media, cx| media.set_style(style, cx));
+            }
+        }
+        if let Some(viewer) = self
+            .expanded_diagram
+            .as_ref()
+            .and_then(|(_, viewer)| viewer.upgrade())
+        {
+            let style = self.style.clone();
+            viewer.update(cx, |viewer, cx| viewer.set_style(style, cx));
+        }
+    }
+
     pub(super) fn selection_input_focused(&self, window: &Window, cx: &App) -> bool {
         self.selection_link
             .as_ref()
@@ -225,24 +247,24 @@ impl BlockEditor {
         });
         let owner = cx.weak_entity();
         let section: Arc<str> = Arc::from(id);
-        let menu = PopupMenu::build(window, cx, move |mut menu, _, _| {
-            menu = menu.min_w(px(180.)).max_h(px(160.)).scrollable(true);
-            for (index, (label, command)) in kind.choices().iter().enumerate() {
-                let owner = owner.clone();
-                let section = section.clone();
-                let command = command.clone();
-                menu = menu.item(
-                    PopupMenuItem::new(*label)
-                        .checked(checked == Some(index))
-                        .on_click(move |_, window, cx| {
-                            let _ = owner.update(cx, |this, cx| {
-                                this.run_selection_action(&section, command.clone(), window, cx);
-                            });
-                        }),
-                );
-            }
-            menu
-        });
+        let mut items = Vec::with_capacity(kind.choices().len());
+        for (index, (label, command)) in kind.choices().iter().enumerate() {
+            let owner = owner.clone();
+            let section = section.clone();
+            let command = command.clone();
+            items.push(EditorPopupItem::new(
+                *label,
+                checked == Some(index),
+                false,
+                move |_, window, cx| {
+                    let _ = owner.update(cx, |this, cx| {
+                        this.run_selection_action(&section, command.clone(), window, cx);
+                    });
+                },
+            ));
+        }
+        let style = self.style.popup_menu.clone();
+        let menu = cx.new(|cx| EditorPopupMenu::new(items, px(160.), style, cx));
         let subscription =
             cx.subscribe_in(&menu, window, |this, menu, _: &DismissEvent, window, cx| {
                 if this
@@ -290,7 +312,7 @@ impl BlockEditor {
         .appearance(false)
         .overlay_closable(false)
         .anchor(Anchor::TopLeft)
-        .trigger(trigger)
+        .trigger(self.style_button(trigger))
         .open(open)
         .on_open_change(cx.listener(move |this, open, window, cx| {
             this.set_selection_dropdown(&target, kind, *open, window, cx);
@@ -531,71 +553,79 @@ impl BlockEditor {
             };
             let target = section.clone();
             bar = bar.child(
-                Toggle::new(name)
-                    .ghost()
-                    .small()
-                    .label(label)
-                    .tooltip(title)
-                    .checked(model.mark_state(mark) == MarkState::On)
-                    .disabled(marks_disabled)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.run_selection_action(
-                            &target,
-                            CommandAction::Editor(EditorCommand::ToggleMark(mark)),
-                            window,
-                            cx,
-                        );
-                    })),
+                self.style_button(
+                    Button::new(name)
+                        .ghost()
+                        .small()
+                        .label(label)
+                        .tooltip(title)
+                        .checked(model.mark_state(mark) == MarkState::On)
+                        .disabled(marks_disabled)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.run_selection_action(
+                                &target,
+                                CommandAction::Editor(EditorCommand::ToggleMark(mark)),
+                                window,
+                                cx,
+                            );
+                        })),
+                ),
             );
         }
         let quote_section = section.clone();
         bar = bar.child(
-            Button::new("selection-quote")
-                .ghost()
-                .small()
-                .icon(self.selection_quote_icon.clone())
-                .accessibility_label("Quote")
-                .tooltip("Quote")
-                .disabled(quote_disabled)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.run_selection_action(
-                        &quote_section,
-                        CommandAction::Editor(EditorCommand::ToggleBlockquote),
-                        window,
-                        cx,
-                    );
-                })),
+            self.style_button(
+                Button::new("selection-quote")
+                    .ghost()
+                    .small()
+                    .icon(self.selection_quote_icon.clone())
+                    .accessibility_label("Quote")
+                    .tooltip("Quote")
+                    .disabled(quote_disabled)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.run_selection_action(
+                            &quote_section,
+                            CommandAction::Editor(EditorCommand::ToggleBlockquote),
+                            window,
+                            cx,
+                        );
+                    })),
+            ),
         );
         let link_section = section.clone();
         bar = bar.child(
-            Button::new("selection-link")
-                .ghost()
-                .small()
-                .icon(self.selection_link_icon.clone())
-                .accessibility_label("Make or edit link")
-                .tooltip("Link")
-                .disabled(marks_disabled)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.open_selection_link(&link_section, window, cx)
-                })),
+            self.style_button(
+                Button::new("selection-link")
+                    .ghost()
+                    .small()
+                    .icon(self.selection_link_icon.clone())
+                    .accessibility_label("Make or edit link")
+                    .tooltip("Link")
+                    .disabled(marks_disabled)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_selection_link(&link_section, window, cx)
+                    })),
+            ),
         );
         let collapsible_section = section.clone();
         bar = bar.child(
-            Button::new("selection-collapsible")
-                .ghost()
-                .small()
-                .icon(self.selection_collapsible_icon.clone())
-                .accessibility_label("Turn into collapsible section")
-                .tooltip("Collapsible")
-                .disabled(collapsible_disabled)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.run_selection_action(
-                        &collapsible_section,
-                        CommandAction::Collapsible,
-                        window,
-                        cx,
-                    );
-                })),
+            self.style_button(
+                Button::new("selection-collapsible")
+                    .ghost()
+                    .small()
+                    .icon(self.selection_collapsible_icon.clone())
+                    .accessibility_label("Turn into collapsible section")
+                    .tooltip("Collapsible")
+                    .disabled(collapsible_disabled)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.run_selection_action(
+                            &collapsible_section,
+                            CommandAction::Collapsible,
+                            window,
+                            cx,
+                        );
+                    })),
+            ),
         );
         bar = bar.child(
             self.selection_dropdown_control(
@@ -628,6 +658,7 @@ impl BlockEditor {
             .gap_1()
             .occlude()
             .on_scroll(|_, _, cx| cx.stop_propagation())
+            .refine_style(&self.style.selection_toolbar)
             .child(
                 Toolbar::new("selection-toolbar-controls")
                     .small()
@@ -653,41 +684,53 @@ impl BlockEditor {
                 .gap_1()
                 .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
                 .child(
-                    Button::new("selection-link-apply")
-                        .small()
-                        .label("Apply")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.apply_selection_link(false, window, cx)
-                        })),
+                    self.style_button(
+                        Button::new("selection-link-apply")
+                            .small()
+                            .label("Apply")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.apply_selection_link(false, window, cx)
+                            })),
+                    ),
                 )
                 .child(
-                    Button::new("selection-link-remove")
-                        .ghost()
-                        .small()
-                        .label("Remove link")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.apply_selection_link(true, window, cx)
-                        })),
+                    self.style_button(
+                        Button::new("selection-link-remove")
+                            .ghost()
+                            .small()
+                            .label("Remove link")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.apply_selection_link(true, window, cx)
+                            })),
+                    ),
                 )
                 .child(
-                    Button::new("selection-link-cancel")
-                        .ghost()
-                        .small()
-                        .label("Cancel")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.cancel_selection_link(window, cx)
-                        })),
+                    self.style_button(
+                        Button::new("selection-link-cancel")
+                            .ghost()
+                            .small()
+                            .label("Cancel")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.cancel_selection_link(window, cx)
+                            })),
+                    ),
                 );
-            toolbar = toolbar.child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .p_2()
-                    .gap_2()
-                    .items_center()
-                    .child(field)
-                    .child(actions),
-            );
+            let panel = div()
+                .id("selection-link-editor")
+                .flex()
+                .flex_wrap()
+                .p_2()
+                .gap_2()
+                .items_center()
+                .refine_style(&self.style.link_editor)
+                .child(field)
+                .child(actions);
+            #[cfg(test)]
+            let panel = {
+                use gpui_kit::test::TestSupportExt;
+                panel.test_support()
+            };
+            toolbar = toolbar.child(panel);
             if let Some(error) = link.error {
                 toolbar = toolbar.child(div().text_xs().text_color(cx.theme().danger).child(error));
             }

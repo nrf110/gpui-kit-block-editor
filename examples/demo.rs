@@ -1,8 +1,8 @@
 use gpui_kit::component::{ActiveTheme, StyledExt, button::Button};
 use gpui_kit::*;
 use gpui_kit_block_editor::{
-    BlockEditor, CommandAction, Document, DocumentEvent, ExtensionRegistry, RichDocument,
-    SlashCommand,
+    BlockEditor, BlockEditorView, CommandAction, Document, DocumentEvent, EditorStyle,
+    EditorTextStyle, ExtensionRegistry, RichDocument, SlashCommand,
 };
 
 struct Demo {
@@ -59,7 +59,18 @@ impl Demo {
         replica
             .apply_update(&document.encode_state())
             .expect("valid initial update");
-        let left = cx.new(|cx| BlockEditor::new(document, extensions(), window, cx));
+        let left_style = EditorStyle {
+            content: StyleRefinement::default().max_w(px(640.)).gap(px(8.)),
+            ..Default::default()
+        }
+        .with_text(EditorTextStyle {
+            body: StyleRefinement::default()
+                .font_family("Georgia")
+                .text_size(px(17.)),
+            ..Default::default()
+        });
+        let left = cx
+            .new(|cx| BlockEditor::new(document, extensions(), window, cx).with_style(left_style));
         let right = cx.new(|cx| BlockEditor::new(replica, extensions(), window, cx));
         let mut subscriptions = Vec::new();
         for (source, target) in [(left.clone(), right.clone()), (right.clone(), left.clone())] {
@@ -146,10 +157,10 @@ impl Render for Demo {
                 .child(div().flex_1().min_h_0().flex()
                     .child(div().flex_1().min_w_0().flex().flex_col().border_r_1().border_color(cx.theme().border)
                         .child(div().px_5().py_3().border_b_1().border_color(cx.theme().border).text_xs().child("01  /  YOUR WORKSPACE"))
-                        .child(left))
+                        .child(BlockEditorView::new(&left)))
                     .child(div().flex_1().min_w_0().flex().flex_col()
                         .child(div().px_5().py_3().border_b_1().border_color(cx.theme().border).text_xs().child("02  /  COLLABORATOR"))
-                        .child(right)))
+                        .child(BlockEditorView::new(&right))))
                 .child(div().px_5().py_2().border_t_1().border_color(cx.theme().border).text_xs().text_color(cx.theme().muted_foreground)
                     .child(self.error.clone().unwrap_or_else(|| format!("{}  ·  {} local transactions  ·  Yjs-compatible v1 updates", if self.connected { "● Connected in-process" } else { "○ Offline — edits stay local" }, self.updates)))))
     }

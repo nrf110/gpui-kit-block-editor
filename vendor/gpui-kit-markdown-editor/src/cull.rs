@@ -185,6 +185,12 @@ struct Geometry {
 }
 
 impl CullState {
+    pub(crate) fn invalidate_measurements(&mut self) {
+        self.heights.clear();
+        self.index.revision = None;
+        self.visible = None;
+        self.measured.clear();
+    }
     /// Drop layout-dependent measurements when wrapping or zoom changes.
     /// The current frame's spacers are stale; the next render measures all
     /// units before culling resumes.
@@ -210,10 +216,7 @@ impl CullState {
             .is_some_and(|previous| previous != &geometry);
         self.geometry = Some(geometry);
         if changed {
-            self.heights.clear();
-            self.index.revision = None;
-            self.visible = None;
-            self.measured.clear();
+            self.invalidate_measurements();
             return true;
         }
         false

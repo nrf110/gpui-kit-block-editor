@@ -1,6 +1,7 @@
 mod commands;
 mod host;
 mod projection;
+mod presentation;
 mod props;
 mod repro;
 mod rich;

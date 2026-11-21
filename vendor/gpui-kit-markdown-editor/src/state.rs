@@ -371,6 +371,7 @@ pub struct BlockEditorState {
     pub(crate) focus_handle: FocusHandle,
     pub(crate) blink_cursor: Entity<BlinkCursor>,
     pub(crate) style: BlockEditorStyle,
+    pub(crate) presentation: RefCell<super::style::PresentationCache>,
     pub(crate) projection: ProjectionCache,
     /// Last complete frame, written by the element after prepaint.
     pub(crate) frame: Rc<RefCell<FrameLayout>>,
@@ -457,6 +458,7 @@ impl BlockEditorState {
             focus_handle,
             blink_cursor,
             style: BlockEditorStyle::default(),
+            presentation: RefCell::default(),
             projection: ProjectionCache::default(),
             frame: Rc::default(),
             cull: Rc::default(),

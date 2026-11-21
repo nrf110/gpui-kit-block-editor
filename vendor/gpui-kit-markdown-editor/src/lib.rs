@@ -93,7 +93,7 @@ pub use input_rule::InputRule;
 /// `"BlockEditor"` key context, e.g. `KeyBinding::new("cmd-shift-t", ToggleToolbar, Some("BlockEditor"))`.
 pub use state::ToggleToolbar;
 pub use state::{BlockEditorEvent, BlockEditorState, ClipboardPolicy, PasteRequest, SubmitPolicy};
-pub use style::BlockEditorStyle;
+pub use style::{BlockEditorStyle, EditorTextStyle};
 pub use table::{TableEdit, TableLine};
 pub use toolbar::EditorToolbar;
 
