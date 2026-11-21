@@ -1,10 +1,10 @@
 use super::{BlockEditor, Document, DocumentEvent, ExtensionRegistry};
+use crate::native_editor::{BlockPosition, BlockSelection};
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{
     AnyWindowHandle, App, AppContext, Bounds, Entity, EntityInputHandler, SharedString,
     TestAppContext, Window, WindowBounds, WindowOptions, point, px, size,
 };
-use markdown_editor::{BlockPosition, BlockSelection};
 use std::{cell::RefCell, rc::Rc, time::Duration};
 use yrs::{
     sync::{Message, SyncMessage},

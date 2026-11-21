@@ -5,11 +5,21 @@ edition = "2024"
 rust-version = "1.100"
 license = "Apache-2.0"
 description = "Collaborative native rich-text block editor for GPUI Kit"
+include = [
+    "/src/**",
+    "/assets/**",
+    "/examples/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/LICENSE-APACHE",
+    "/NOTICE",
+    "/rust-toolchain.toml",
+]
 
 [dependencies]
 anyhow = "1"
 gpui-kit = { version = "0.10.0", features = ["syntect"] }
-markdown_editor = { package = "gpui-kit-markdown-editor", path = "vendor/gpui-kit-markdown-editor", default-features = false }
 yrs = "0.28.1"
 uuid = { version = "1", features = ["v4"] }
 mermaid-rs-renderer = { version = "0.3.1", default-features = false }

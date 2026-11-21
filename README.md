@@ -23,7 +23,7 @@ The demo connects two independent CRDT replicas in-process. Pause the connection
 - Native editing and reconciliation use structured snapshots directly. Stable node IDs map selections to attributed CRDT text; no Markdown AST or source-offset caret mapping is involved.
 - Markdown input rules and explicit Markdown/template imports remain available at the boundary. Passing `"**literal**"` to `RichDocument::paragraph` stores literal asterisks; it does not apply bold.
 
-The backend is a vendored extension of [gpui-kit-markdown-editor 0.3.0](https://github.com/wabzqem/gpui-kit-markdown-editor), under `vendor/gpui-kit-markdown-editor`, with its Apache license retained. It adds direct structured import/export, stable node identities, and semantic validation. Replacing it with the unmodified crates.io release would remove the required bridge.
+The native editing engine is incorporated into this crate under the private `src/native_editor` module. It derives from [gpui-kit-markdown-editor 0.3.0](https://github.com/wabzqem/gpui-kit-markdown-editor), with structured import/export, stable external node identities, native code editing, and per-instance presentation extensions. There is no separate backend crate or local path dependency.
 
 ## Editing
 
@@ -227,12 +227,15 @@ The marker is retained for future breaking changes; there is no migration layer 
 Configure `ExtensionRegistry` before constructing an editor. Commands retain stable IDs and registration order; duplicate IDs are errors.
 
 ```rust
+use gpui_kit::assets::IconName;
 use gpui_kit_block_editor::{CommandAction, ExtensionRegistry, SlashCommand};
 
 let mut extensions = ExtensionRegistry::default();
 extensions.commands.register(SlashCommand {
     id: "callout".into(),
     title: "Callout".into(),
+    group: "Text".into(),
+    icon: IconName::MessageSquareText,
     description: "Insert an editorial note".into(),
     keywords: vec!["note".into()],
     action: CommandAction::InsertMarkdown("> **Note**\n> Shared context.".into()),
@@ -240,6 +243,8 @@ extensions.commands.register(SlashCommand {
 ```
 
 `CommandAction::Editor` runs a native formatting command; list/quote/nesting operations update the shared outer tree. `InsertMarkdown` is an explicit template-import boundary. `CommandAction::Collapsible` uses the same command registry as built-ins.
+
+`EditorCommand`, `BlockKind`, `MarkKind`, `MarkChange`, `MarkState`, and `TableEdit` are available from `gpui_kit_block_editor`; applications do not need a separate editing-backend dependency.
 
 Implement `PreviewExtension` with `language()` and `render_svg(source)`, then `register_preview()`. Previews receive a semantic code block's plain contents, not fenced Markdown. Rendering runs on the background executor; superseded results are discarded. Duplicate languages are rejected case-insensitively.
 
@@ -308,3 +313,6 @@ Native headless GPUI tests exercise typed editing, literal Markdown text, rich/e
 
 Model tests cover independent formatting/text merges, real shared-text identity, semantic tree ordering, unsupported-version rejection without partial changes, JSON boundaries, conflicts, and sync framing. Markdown boundary tests cover semantic import/export, definitions, whitespace normalization, lists, quotes, and collapsible roundtrips.
 
+## License and attribution
+
+This crate is licensed under Apache-2.0. The incorporated native editing engine retains its upstream attribution and license in `NOTICE` and `LICENSE-APACHE`; modified source files identify the integration changes. The unused upstream standalone wrapper and formatting toolbar are not included. The retained native engine tests run as part of `cargo test --lib`.

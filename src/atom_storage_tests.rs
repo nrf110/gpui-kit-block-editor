@@ -1,7 +1,7 @@
 use super::*;
+use crate::native_editor::BlockEditorModel;
+use crate::native_editor::rich::{RichAtom, RichMarks, RichRun};
 use gpui_kit::base::text::MarkdownExtensions;
-use markdown_editor::BlockEditorModel;
-use markdown_editor::rich::{RichAtom, RichMarks, RichRun};
 use yrs::types::Attrs;
 
 fn custom_atom() -> RichAtom {

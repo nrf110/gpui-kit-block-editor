@@ -779,7 +779,7 @@ fn divider_in_list_and_collapsible_titles_preserves_the_title_and_existing_body(
 
 #[gpui_kit::test]
 fn divider_object_selection_clears_on_outside_click_and_focus_changes(cx: &mut TestAppContext) {
-    use markdown_editor::{BlockPosition, BlockSelection};
+    use crate::native_editor::{BlockPosition, BlockSelection};
 
     for whole_block in [false, true] {
         for exit in 0..3 {

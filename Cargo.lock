@@ -2692,7 +2692,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "gpui-kit",
- "gpui-kit-markdown-editor",
  "markdown",
  "mermaid-rs-renderer",
  "serde",
@@ -2701,18 +2700,6 @@ dependencies = [
  "unicode-segmentation",
  "uuid",
  "yrs",
-]
-
-[[package]]
-name = "gpui-kit-markdown-editor"
-version = "0.3.0"
-dependencies = [
- "gpui-kit",
- "markdown",
- "serde",
- "serde_json",
- "unicode-segmentation",
- "uuid",
 ]
 
 [[package]]

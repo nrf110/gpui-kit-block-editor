@@ -1,13 +1,13 @@
 use super::BlockEditor;
 use super::collaboration_tests::{replica, select, set_text, setup};
+use crate::native_editor::rich::{RichKind, RichNode};
+use crate::native_editor::{BlockEditorModel, BlockSelection, EditorCommand};
 use gpui_kit::component::input::{EditorState, Undo};
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{
     AnyWindowHandle, App, AppContext, Entity, EntityInputHandler, Focusable, ScrollDelta,
     TestAppContext, Window, point, px,
 };
-use markdown_editor::rich::{RichKind, RichNode};
-use markdown_editor::{BlockEditorModel, BlockSelection, EditorCommand};
 use serde_json::{Value, json};
 use std::time::Duration;
 

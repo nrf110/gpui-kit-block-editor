@@ -95,7 +95,7 @@ impl BlockEditor {
                 .as_ref()
                 .context("media command has no semantic mapping")?;
             let anchor = map
-                .point(markdown_editor::BlockPosition::new(caret.block, start))
+                .point(crate::native_editor::BlockPosition::new(caret.block, start))
                 .context("media command start is not mapped")?;
             let head = map
                 .point(caret)

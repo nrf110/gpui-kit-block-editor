@@ -562,7 +562,7 @@ fn formatting_only_keeps_text_and_noop_keeps_state_vector() {
 
 #[test]
 fn semantic_deletion_and_structural_node_anchors_are_safe() {
-    use markdown_editor::rich::{RichKind, RichNode};
+    use crate::native_editor::rich::{RichKind, RichNode};
     let mut document = Document::new();
     let id = document.insert_section(None, "body").unwrap();
     let mut content = body_content(&document, &id);

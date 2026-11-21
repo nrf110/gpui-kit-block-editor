@@ -1,11 +1,11 @@
 use std::{collections::HashMap, fmt, sync::Arc};
 
 use crate::media::{FileMediaStore, MediaKind, MediaStore};
+use crate::native_editor::rich::{RichDocument, RichKind, RichNode};
+use crate::native_editor::{BlockKind, EditorCommand, MarkKind, TableEdit};
 use anyhow::{Context, Result, ensure};
 use gpui_kit::assets::IconName;
 use gpui_kit::{AssetSource, component::Icon};
-use markdown_editor::rich::{RichDocument, RichKind, RichNode};
-use markdown_editor::{BlockKind, EditorCommand, MarkKind, TableEdit};
 
 // Keep the component self-contained: these glyphs are not in GPUI Kit's default bundle.
 gpui_kit::assets::icon_assets!(

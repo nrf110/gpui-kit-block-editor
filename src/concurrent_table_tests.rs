@@ -1,7 +1,9 @@
 use super::*;
+use crate::native_editor::{
+    BlockEditorModel, BlockPosition, BlockSelection, EditorCommand, TableEdit,
+};
 use crate::{RichNode, RichRun};
 use gpui_kit::base::text::MarkdownExtensions;
-use markdown_editor::{BlockEditorModel, BlockPosition, BlockSelection, EditorCommand, TableEdit};
 use std::collections::BTreeMap;
 
 const TABLE: &str = "| H0 | H1 |\n| --- | ---: |\n| B0 | B1 |";
@@ -375,7 +377,7 @@ fn malformed_table_children_and_alignment_values_still_reject_atomically() {
     }
 }
 
-struct NativeTableRoot(gpui_kit::Entity<markdown_editor::BlockEditorState>);
+struct NativeTableRoot(gpui_kit::Entity<crate::native_editor::BlockEditorState>);
 
 impl gpui_kit::Render for NativeTableRoot {
     fn render(
@@ -387,7 +389,7 @@ impl gpui_kit::Render for NativeTableRoot {
         gpui_kit::div()
             .w(gpui_kit::px(700.))
             .h(gpui_kit::px(600.))
-            .child(markdown_editor::BlockEditor::new(&self.0))
+            .child(crate::native_editor::BlockEditor::new(&self.0))
     }
 }
 
@@ -401,7 +403,7 @@ fn merged_tables_render_every_surviving_cell_and_remain_natively_editable(
         crate::init(cx);
     });
     let (root, cx) = cx.add_window_view(|window, cx| {
-        NativeTableRoot(cx.new(|cx| markdown_editor::BlockEditorState::new(window, cx)))
+        NativeTableRoot(cx.new(|cx| crate::native_editor::BlockEditorState::new(window, cx)))
     });
     let editor = root.read_with(cx, |root, _| root.0.clone());
     for conflict in conflicts() {

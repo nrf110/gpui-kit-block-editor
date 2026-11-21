@@ -1,11 +1,11 @@
 use super::*;
+use crate::native_editor::{MarkChange, MarkKind, MarkState};
 use crate::popup_menu::{EditorPopupItem, EditorPopupMenu};
 use gpui_kit::component::toolbar::Toolbar;
 use gpui_kit::component::{
     input::{Input, InputEvent, InputState},
     popover::Popover,
 };
-use markdown_editor::{MarkChange, MarkKind, MarkState};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum SelectionPanel {

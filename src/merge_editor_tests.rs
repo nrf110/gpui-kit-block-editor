@@ -1,10 +1,10 @@
 use super::collaboration_tests::{replica, select, setup};
+use crate::native_editor::{
+    BlockKind as NativeBlockKind, BlockSelection, EditorCommand, MarkKind, TableEdit,
+};
 use crate::{CommandAction, RichKind, RichNode};
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{AppContext, TestAppContext};
-use markdown_editor::{
-    BlockKind as NativeBlockKind, BlockSelection, EditorCommand, MarkKind, TableEdit,
-};
 
 #[gpui_kit::test]
 fn a_remote_mark_on_converted_code_keeps_the_native_editor_usable_without_rewriting_peer_state(
@@ -56,7 +56,7 @@ fn a_remote_mark_on_converted_code_keeps_the_native_editor_usable_without_rewrit
         );
         assert_eq!(
             state.model().mark_state(MarkKind::Bold),
-            markdown_editor::MarkState::Off
+            crate::native_editor::MarkState::Off
         );
     });
     cx.update_window(handle, |_, window, cx| window.press("cmd-z", cx))

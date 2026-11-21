@@ -1,12 +1,12 @@
 use super::collaboration_tests::{replica, select, set_text, setup};
 use super::{BlockEditor, SectionKind};
 use crate::BlockSpec;
+use crate::native_editor::BlockSelection;
+use crate::native_editor::rich::{RichDocument, RichKind, RichMarks};
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{
     App, AppContext, Entity, ScrollDelta, SharedString, TestAppContext, Window, point, px,
 };
-use markdown_editor::BlockSelection;
-use markdown_editor::rich::{RichDocument, RichKind, RichMarks};
 
 fn click_menu_item(window: &mut Window, label: &str, cx: &mut App) {
     let item = window.within("popup-menu").find_by_label(label);

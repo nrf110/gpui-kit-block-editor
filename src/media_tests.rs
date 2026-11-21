@@ -2,9 +2,9 @@ use crate::media::{
     FileMediaStore, MediaAttachment, MediaKind, MediaStore, validate_media_atom,
     validate_media_content,
 };
+use crate::native_editor::BlockEditorModel;
 use crate::{BlockSpec, Document, RichAtom, RichDocument, RichKind, RichNode, SectionKind};
 use gpui_kit::base::text::MarkdownExtensions;
-use markdown_editor::BlockEditorModel;
 use serde_json::{Value, json};
 use std::{
     fs,

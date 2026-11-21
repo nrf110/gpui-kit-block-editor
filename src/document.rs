@@ -5,7 +5,7 @@
 //! Markdown and JSON are explicit boundaries, never collaborative storage.
 
 use crate::block::{BlockSpec, SectionKind};
-use markdown_editor::rich::{RICH_DOCUMENT_VERSION, RichDocument, RichKind};
+use crate::native_editor::rich::{RICH_DOCUMENT_VERSION, RichDocument, RichKind};
 use serde::{Deserialize, Serialize};
 #[path = "rich_storage.rs"]
 mod rich_storage;
@@ -1245,7 +1245,7 @@ impl Document {
         }
         let reuse_path = reuse_path.unwrap();
         fn collect_ids<'a>(
-            nodes: &'a [markdown_editor::rich::RichNode],
+            nodes: &'a [crate::native_editor::rich::RichNode],
             ids: &mut HashSet<&'a str>,
         ) {
             for node in nodes {
@@ -1254,7 +1254,7 @@ impl Document {
             }
         }
         fn has_existing_nodes(
-            nodes: &[markdown_editor::rich::RichNode],
+            nodes: &[crate::native_editor::rich::RichNode],
             ids: &HashSet<&str>,
         ) -> bool {
             nodes.iter().any(|node| {
@@ -2172,7 +2172,7 @@ fn edit_text(document: &mut Document, id: &str, text: &str) -> Result<()> {
     block.runs = if text.is_empty() {
         vec![]
     } else {
-        vec![markdown_editor::rich::RichRun {
+        vec![crate::native_editor::rich::RichRun {
             text: text.to_owned(),
             marks,
             atom: None,

@@ -1,10 +1,10 @@
 use super::collaboration_tests::{replica, setup};
+use crate::native_editor::{BlockSelection, TableLine};
 use crate::{BlockEditor, RichDocument};
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{
     AnyWindowHandle, App, AppContext, Entity, Modifiers, TestAppContext, VisualTestContext, Window,
 };
-use markdown_editor::{BlockSelection, TableLine};
 
 fn open_menu(
     editor: &Entity<BlockEditor>,

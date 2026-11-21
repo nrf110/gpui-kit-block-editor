@@ -1,8 +1,8 @@
 use std::{collections::HashSet, ops::Range};
 
+use crate::native_editor::rich::{RichDocument, RichKind};
 use anyhow::{Context, Result};
 use markdown::mdast::Node;
-use markdown_editor::rich::{RichDocument, RichKind};
 
 use crate::block::{BlockSpec, SectionKind};
 
@@ -67,7 +67,7 @@ impl Draft {
             {
                 content
                     .blocks
-                    .insert(0, markdown_editor::rich::RichNode::paragraph(""));
+                    .insert(0, crate::native_editor::rich::RichNode::paragraph(""));
             }
             let mut definitions = HashSet::new();
             content.blocks.retain(|node| {

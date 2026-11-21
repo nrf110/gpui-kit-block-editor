@@ -9,17 +9,17 @@ use std::{
 use anyhow::Context as _;
 
 use crate::button::EditorButton as Button;
+use crate::native_editor::rich::{RichDocument, RichKind, RichNode};
+use crate::native_editor::{
+    BlockEditorEvent, BlockEditorState, BlockKind as NativeBlockKind, BlockSelection,
+    CapturedRange, EditOrigin, EditorCommand,
+};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme, Icon, IconName, Sizable, StyledExt, WindowExt, checkbox::Checkbox,
 };
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
-use markdown_editor::rich::{RichDocument, RichKind, RichNode};
-use markdown_editor::{
-    BlockEditorEvent, BlockEditorState, BlockKind as NativeBlockKind, BlockSelection,
-    CapturedRange, EditOrigin, EditorCommand,
-};
 use yrs::Assoc;
 
 use crate::{
@@ -2584,7 +2584,7 @@ impl Render for BlockEditor {
                                 )
                             })
                             .child(
-                                markdown_editor::BlockEditor::new(&editor)
+                                crate::native_editor::BlockEditor::new(&editor)
                                     .presentation(if quoted {
                                         self.quoted_text.clone()
                                     } else {

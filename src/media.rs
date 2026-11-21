@@ -1,6 +1,6 @@
 //! Replicated media references and a persistent, host-local asset store.
+use crate::native_editor::rich::{RichAtom, RichDocument, RichKind, RichMarks, RichNode, RichRun};
 use anyhow::{Context, Result, ensure};
-use markdown_editor::rich::{RichAtom, RichDocument, RichKind, RichMarks, RichNode, RichRun};
 use serde::{Deserialize, Serialize};
 use std::{
     env,

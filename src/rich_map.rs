@@ -1,8 +1,8 @@
 use std::{collections::HashMap, sync::Arc};
 
+use crate::native_editor::rich::{RichDocument, RichKind, RichNode};
+use crate::native_editor::{Affinity, BlockEditorModel, BlockId, BlockPosition, BlockSelection};
 use anyhow::{Context, Result, ensure};
-use markdown_editor::rich::{RichDocument, RichKind, RichNode};
-use markdown_editor::{Affinity, BlockEditorModel, BlockId, BlockPosition, BlockSelection};
 use unicode_segmentation::UnicodeSegmentation;
 use yrs::Assoc;
 
@@ -116,7 +116,7 @@ impl RichMap {
                     || (atomic
                         && node.kind == RichKind::Custom
                         && matches!(node.runs.as_slice(), [run] if run.text == "\u{FFFC}"
-                            && matches!(run.atom, Some(markdown_editor::rich::RichAtom::Custom { .. })))),
+                            && matches!(run.atom, Some(crate::native_editor::rich::RichAtom::Custom { .. })))),
                 "non-text native node has semantic text"
             );
             boundaries.push(0);

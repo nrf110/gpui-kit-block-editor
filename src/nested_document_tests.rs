@@ -145,7 +145,7 @@ fn markdown_serializes_nested_numbering_bullets_tasks_and_quotes() {
             ]),
         )
         .unwrap();
-    fn clear_ids(nodes: &mut [markdown_editor::rich::RichNode]) {
+    fn clear_ids(nodes: &mut [crate::native_editor::rich::RichNode]) {
         for node in nodes {
             node.id.clear();
             clear_ids(&mut node.children);

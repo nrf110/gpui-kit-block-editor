@@ -1,7 +1,7 @@
 //! Semantic Yjs storage. Every node owns a permanent attributed text leaf;
 //! metadata keys and marks are independent registers, never a document blob.
 use super::*;
-use markdown_editor::rich::{RichMarks, RichNode, RichRun};
+use crate::native_editor::rich::{RichMarks, RichNode, RichRun};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use yrs::types::Attrs;
@@ -115,7 +115,7 @@ fn read_runs<T: ReadTxn>(text: &TextRef, txn: &T) -> Result<Vec<RichRun>> {
             bail!("semantic text contains a non-text embed")
         };
         let mut marks = serde_json::to_value(RichMarks::default())?;
-        let mut atom: Option<markdown_editor::rich::RichAtom> = None;
+        let mut atom: Option<crate::native_editor::rich::RichAtom> = None;
         if let Some(attrs) = diff.attributes {
             for (key, value) in *attrs {
                 if value == Any::Null {

@@ -1,0 +1,17 @@
+GPUI Kit Block Editor
+
+This distribution incorporates source derived from gpui-kit-markdown-editor 0.3.0:
+https://github.com/wabzqem/gpui-kit-markdown-editor
+
+Copyright 2024 - 2026 Longbridge <https://longbridge.com>
+Licensed under the Apache License, Version 2.0; see LICENSE-APACHE.
+
+The upstream editor originated in the GPUI Kit block editor work:
+https://github.com/longbridge/gpui-kit/pull/3049
+https://github.com/longbridge/gpui-kit/pull/3566
+
+The incorporated engine in src/native_editor has been modified for structured
+document interchange, stable external node identities, editor composition,
+selection and table behavior, native code editing, per-instance presentation,
+and integration into this crate. The upstream standalone themed wrapper and
+optional formatting toolbar have been removed.

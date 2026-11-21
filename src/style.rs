@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
+use crate::native_editor::EditorTextStyle;
 use gpui_kit::{Refineable as _, StyleRefinement};
-use markdown_editor::EditorTextStyle;
 
 /// Local presentation overrides. Unset properties retain the current GPUI theme
 /// and the editor's standard layout. None of these values are document data.

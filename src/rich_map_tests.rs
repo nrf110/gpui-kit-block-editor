@@ -1,6 +1,6 @@
 use super::*;
+use crate::native_editor::{BlockKind, EditorCommand, MarkKind};
 use gpui_kit::base::text::MarkdownExtensions;
-use markdown_editor::{BlockKind, EditorCommand, MarkKind};
 
 fn parsed(source: &str) -> BlockEditorModel {
     BlockEditorModel::from_markdown(source, MarkdownExtensions::default()).unwrap()

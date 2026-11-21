@@ -1,9 +1,9 @@
 use super::collaboration_tests::{select, setup};
 use super::{BlockEditor, BlockSpec, RichDocument, SectionKind};
+use crate::native_editor::BlockSelection;
 use crate::{MediaAttachment, MediaKind};
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{App, AppContext, Entity, EntityInputHandler, Focusable, TestAppContext, Window};
-use markdown_editor::BlockSelection;
 
 fn focused(editor: &Entity<BlockEditor>, id: &str, window: &Window, cx: &App) {
     let editor = editor.read(cx);
@@ -535,7 +535,7 @@ fn reference_metadata_is_not_a_navigation_target_and_unicode_entry_is_grapheme_a
         let native = editor.read(cx).views[&order[1]].editor.read(cx);
         let caret = native.model().caret().unwrap();
         let leaf = native.model().document().block(caret.block).unwrap();
-        assert_eq!(leaf.kind(), markdown_editor::BlockKind::Paragraph);
+        assert_eq!(leaf.kind(), crate::native_editor::BlockKind::Paragraph);
         let text = leaf.text().unwrap();
         assert!(
             text.grapheme_indices(true)

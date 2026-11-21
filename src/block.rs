@@ -1,5 +1,5 @@
+use crate::native_editor::rich::{RichDocument, RichKind, RichNode};
 use anyhow::{Result, anyhow};
-use markdown_editor::rich::{RichDocument, RichKind, RichNode};
 use serde::{Deserialize, Serialize};
 
 /// Structural role of a collaborative section. Editable sections own native

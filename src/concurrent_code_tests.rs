@@ -1,9 +1,9 @@
 use super::*;
-use gpui_kit::base::text::MarkdownExtensions;
-use markdown_editor::{
+use crate::native_editor::{
     BlockEditorModel,
     rich::{RichAtom, RichMarks, RichRun},
 };
+use gpui_kit::base::text::MarkdownExtensions;
 use yrs::types::Attrs;
 
 fn content(document: &Document, id: &str) -> RichDocument {
