@@ -19,7 +19,7 @@ The demo connects two independent CRDT replicas in-process. Pause the connection
 
 - `Section` has a permanent ID, `parent`, structural `kind`, derived `depth`, and semantic `content: RichDocument`.
 - `RichDocument` contains versioned `RichNode`s with stable IDs, typed `RichKind`s, metadata attributes, marked text runs, inline atoms, and children. Headings store a level; code stores a language and plain text; tables store rows/cells. Formatting is data, not Markdown delimiters.
-- `SectionKind` describes the outer block tree: text, list group, list item/task, quote, or editable collapsible title. A table remains one draggable outer block, with semantic rows/cells inside its content.
+- `SectionKind` describes the outer block tree: text, list group, ordinary/task/collapsible list item, quote, or editable collapsible title. A table remains one draggable outer block, with semantic rows/cells inside its content.
 - Native editing and reconciliation use structured snapshots directly. Stable node IDs map selections to attributed CRDT text; no Markdown AST or source-offset caret mapping is involved.
 - Markdown input rules and explicit Markdown/template imports remain available at the boundary. Passing `"**literal**"` to `RichDocument::paragraph` stores literal asterisks; it does not apply bold.
 
@@ -32,7 +32,7 @@ The backend is a vendored extension of [gpui-kit-markdown-editor 0.3.0](https://
 - **Tab / Shift+Tab** nests and unnests blocks when the slash menu is closed. Nested children move with their parent. Enter on an empty list item exits its list; new task items start unchecked.
 - Hover a row to reveal its vertically centered **+** command button, **⠿** grip, and trash icon. Drop on another row to move before it, including across lists. A list's end strip appends to that list; strips before/after lists pull items to the parent level. The document's bottom drop area moves items out to the top level. Lists renumber automatically.
 - Click a grip to select a block. **Shift-click** selects a visible range; **Cmd/Ctrl-click** toggles individual blocks; **Escape** clears selection. Drag a selected grip to move the selection in document order. A multi-block selection covering every item moves the original list container; **Alt/Option-click** explicitly selects a whole list, including a one-item list.
-- Successful drops clear selection and its range anchor. Selected ancestors cover their descendants, so a subtree never moves twice. Cross-editor drops, cycles, and moving a collapsible container directly into a list are rejected.
+- Successful drops clear selection and its range anchor. Selected ancestors cover their descendants, so a subtree never moves twice. Cross-editor drops, cycles, and noneditable containers inside lists are rejected. Collapsible titles adopt the destination's list role without losing their bodies or folding state.
 - The trash icon deletes its block and children. **Add block** creates a top-level paragraph.
 - Click **+** to the left of a block's grip, or type **/**, to open the command menu. Opening with **+** preserves the text and selection without inserting a slash; formatting commands apply to that selection. The **+** menu floats beside its button without moving the block. Wheel scrolling stays inside either menu, including at its scroll limits. Scroll to browse every command, or type **/** and keep typing to filter. **Up/Down** keeps the selected command in view; **Enter/Tab** accepts it and **Escape** dismisses the menu. Commands include headings, marks, lists/tasks, quotes, tables and cell operations, code, Mermaid, and collapsible sections. IME composition is not intercepted.
 - **Cmd/Ctrl+B / I** applies styling. **Cmd/Ctrl+Z / Shift+Z** undoes/redoes this replica's edits without undoing peers' changes. Heading levels provide font sizes; arbitrary font families/point sizes are not exposed by the current native renderer.
@@ -43,7 +43,7 @@ Group headings are larger and semibold; indented command rows pair a muted icon 
 
 ### Selection toolbar
 
-Highlight text to show a floating toolbar above the selected glyphs. It follows wrapping and scrolling without moving the document, and flips below the selection when there is no room above. The toolbar offers paragraph/heading 1–6 presets, bold, italic, underline, quote, link editing, collapsible sections, and bulleted, numbered, or task lists.
+Highlight text to show a floating toolbar above the selected glyphs. It follows wrapping and scrolling without moving the document, and flips below the selection when there is no room above. The toolbar offers paragraph/heading 1–6 presets, bold, italic, underline, quote, link editing, collapsible sections, and bulleted, numbered, task, or collapsible lists.
 
 Style and list choices open separate, keyboard-navigable dropdown menus anchored to their buttons, without adding a toolbar row. Wheel scrolling stays inside each dropdown, even at its scroll limits. Quote, link, collapsible-section, and list controls use embedded icons with hover tooltips and accessible labels.
 
@@ -64,6 +64,14 @@ Type **/collapsible** and press **Enter**, or scroll the **/** menu and click **
 The title's chevron shows or hides its entire subtree. The shared `default_collapsed` value starts true; each editor's expansion override is local and does not emit a document update. Hidden body editors and content are retained, so peer edits are available on reopening. Focusing a hidden child expands its ancestors. Dragging or deleting the title moves or removes the entire section; undo restores it.
 
 These are explicit title/body containers, not ranges inferred from the next heading. Nest existing blocks beneath the title to include them.
+
+### Collapsible lists
+
+Choose **Lists → Collapsible list** in the **+** or slash menu, type **/collapsible-list**, or use the selection toolbar's **List** dropdown. The current block becomes a foldable list title, preserving its rich text and existing children. Empty titles remain blank; items without children receive an initial editable body. The creator's view opens immediately and keeps the title focused.
+
+**Enter** in a title splits it into sibling collapsible items; **Enter** on an empty title exits the list. **Tab / Shift+Tab**, block selection, whole-list dragging, reordering, and collaborative undo work as with other lists. Pulling an item out of its group preserves it as a standalone collapsible section; dragging it back into a list restores its collapsible-item role. Reapplying **Collapsible list** also lifts it into a standalone section. Explicitly choosing a bulleted, numbered, or task list removes folding but preserves the body.
+
+Each chevron hides only that item's descendants, independently on each replica. `SectionKind::CollapsibleListItem` stores the shared initial folding state inside an ordinary list group; mixed item types are allowed. Native JSON and CRDT updates retain the item type. Markdown import/export represents these items as list entries containing `<details>` disclosures, preserving title/body structure rather than inserting an empty list-item wrapper.
 
 ### Mermaid
 

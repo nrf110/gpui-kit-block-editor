@@ -10,6 +10,7 @@ pub enum SectionKind {
     Text,
     List { ordered: bool, start: u64 },
     ListItem { checked: Option<bool> },
+    CollapsibleListItem { default_collapsed: bool },
     Quote,
     Collapsible { default_collapsed: bool },
 }
@@ -18,8 +19,26 @@ impl SectionKind {
     pub fn is_editable(&self) -> bool {
         matches!(
             self,
-            Self::Text | Self::ListItem { .. } | Self::Collapsible { .. }
+            Self::Text
+                | Self::ListItem { .. }
+                | Self::CollapsibleListItem { .. }
+                | Self::Collapsible { .. }
         )
+    }
+
+    pub fn is_list_item(&self) -> bool {
+        matches!(
+            self,
+            Self::ListItem { .. } | Self::CollapsibleListItem { .. }
+        )
+    }
+
+    pub fn default_collapsed(&self) -> Option<bool> {
+        match self {
+            Self::Collapsible { default_collapsed }
+            | Self::CollapsibleListItem { default_collapsed } => Some(*default_collapsed),
+            _ => None,
+        }
     }
 }
 

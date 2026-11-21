@@ -406,7 +406,7 @@ impl BlockEditor {
             let state = view.editor.read(cx);
             let native = state.model().document();
             if state.is_readonly()
-                || !matches!(view.kind, SectionKind::Text | SectionKind::ListItem { .. })
+                || !(view.kind == SectionKind::Text || view.kind.is_list_item())
                 || !matches!(state.selection(), BlockSelection::Text { anchor, head }
                     if anchor == head && *head == native.first_caret())
                 || !native.leaves().all(|leaf| {
@@ -432,7 +432,7 @@ impl BlockEditor {
         }
         let exit_list = key.key == "enter"
             && !key.modifiers.shift
-            && matches!(view.kind, SectionKind::ListItem { .. })
+            && view.kind.is_list_item()
             && view.content.blocks.iter().all(|node| {
                 node.kind == RichKind::Paragraph
                     && node.children.is_empty()
@@ -549,17 +549,14 @@ impl BlockEditor {
     }
 
     fn is_collapsed(&self, id: &str) -> bool {
-        let Some(TreeNode {
-            kind: SectionKind::Collapsible { default_collapsed },
-            ..
-        }) = self.tree.get(id)
+        let Some(default_collapsed) = self
+            .tree
+            .get(id)
+            .and_then(|node| node.kind.default_collapsed())
         else {
             return false;
         };
-        self.collapsed
-            .get(id)
-            .copied()
-            .unwrap_or(*default_collapsed)
+        self.collapsed.get(id).copied().unwrap_or(default_collapsed)
     }
 
     fn toggle_collapsed(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -700,6 +697,9 @@ impl BlockEditor {
                 .find(|(candidate, _)| *candidate == path)
                 .map(|(_, id)| id)
                 .context("split block identity was not retained")?;
+            if matches!(self.views[id].kind, SectionKind::CollapsibleListItem { .. }) {
+                self.collapsed.insert(target.clone(), false);
+            }
             self.reconcile(window, cx);
             if focused {
                 self.focus_block_at(&target, Some(caret), window, cx)?;
@@ -748,13 +748,15 @@ impl BlockEditor {
             .position(|section| section.id == id)
             .context("block is not in its parent")?;
         let before = siblings.get(index + 1).map(|section| section.id.as_str());
-        let in_list = matches!(self.views[id].kind, SectionKind::ListItem { .. });
+        let in_list = self.views[id].kind.is_list_item();
         let parsed = parse_blocks(markdown)?;
         let vector = self.document.state_vector();
         for mut spec in parsed.blocks {
             if in_list {
                 if spec.kind == SectionKind::Text {
                     spec.kind = SectionKind::ListItem { checked: None };
+                } else if let SectionKind::Collapsible { default_collapsed } = spec.kind {
+                    spec.kind = SectionKind::CollapsibleListItem { default_collapsed };
                 } else {
                     spec = BlockSpec {
                         kind: SectionKind::ListItem { checked: None },
@@ -1326,8 +1328,8 @@ impl BlockEditor {
                     list.last = Some(section.id.clone());
                 }
             }
-            let marker = if let SectionKind::ListItem { checked } = section.kind {
-                let ordinal = if let Some(parent) = &section.parent {
+            let ordinal = if section.kind.is_list_item() {
+                if let Some(parent) = &section.parent {
                     if let Some(count) = counters.get_mut(parent) {
                         let ordinal = *count;
                         *count += 1;
@@ -1338,7 +1340,11 @@ impl BlockEditor {
                     }
                 } else {
                     0
-                };
+                }
+            } else {
+                0
+            };
+            let marker = if let SectionKind::ListItem { checked } = section.kind {
                 let label = match list_style {
                     Some((true, start)) => format!("{}.", start.saturating_add(ordinal)).into(),
                     _ if checked.is_some() => SharedString::default(),
@@ -1608,22 +1614,33 @@ impl BlockEditor {
                 .completion
                 .as_ref()
                 .filter(|c| c.section == id && c.query == query)
-                .map_or(0, |c| c.selected);
+                .map(|c| c.selected);
             let commands = self.extensions.commands.search(&query);
             let scroll = self
                 .completion
                 .as_ref()
                 .filter(|c| c.section == id && c.query == query)
                 .map_or_else(ScrollHandle::new, |c| c.scroll.clone());
-            Completion {
+            let completion = Completion {
                 section: id.to_owned(),
                 range: Some(range),
                 anchor_to_button: false,
+                selected: selected
+                    .unwrap_or_else(|| {
+                        commands
+                            .iter()
+                            .position(|command| command.id.eq_ignore_ascii_case(&query))
+                            .unwrap_or(0)
+                    })
+                    .min(commands.len().saturating_sub(1)),
                 query,
-                selected: selected.min(commands.len().saturating_sub(1)),
                 commands,
                 scroll,
+            };
+            if selected.is_none() && !completion.commands.is_empty() {
+                completion.scroll_to_selected();
             }
+            completion
         });
         cx.notify();
     }
@@ -1715,6 +1732,14 @@ impl BlockEditor {
                     self.collapsed.insert(id.to_owned(), false);
                     self.reconcile(window, cx);
                     self.focus_block_at(&child, None, window, cx)?;
+                    self.publish(&vector, cx);
+                }
+                CommandAction::CollapsibleList => {
+                    let vector = self.document.state_vector();
+                    self.document.wrap_collapsible_list(id)?;
+                    self.collapsed.insert(id.to_owned(), false);
+                    self.reconcile(window, cx);
+                    // Like other list conversions, retain the selected title text.
                     self.publish(&vector, cx);
                 }
                 CommandAction::Editor(_) => {}
@@ -1998,9 +2023,7 @@ impl BlockEditor {
         roots.iter().all(|root| {
             self.tree.get(&root.id).is_some_and(|node| {
                 node.parent == root.parent
-                    && (!into_list
-                        || (node.kind.is_editable()
-                            && !matches!(node.kind, SectionKind::Collapsible { .. })))
+                    && (!into_list || node.kind.is_editable())
                     && !target
                         .parent
                         .as_ref()
@@ -2018,7 +2041,7 @@ impl BlockEditor {
         let anchor = list
             .parent
             .as_ref()
-            .filter(|owner| matches!(self.tree[*owner].kind, SectionKind::ListItem { .. }))
+            .filter(|owner| self.tree[*owner].kind.is_list_item())
             .map_or(group, String::as_str);
         let parent = self.tree[anchor].parent.clone();
         let before = if after {
@@ -2168,7 +2191,7 @@ impl Render for BlockEditor {
             let indent = view.indent;
             let parent = view.parent.clone();
             let marker = view.marker.clone();
-            let collapsible = matches!(view.kind, SectionKind::Collapsible { .. });
+            let collapsible = view.kind.default_collapsed().is_some();
             let collapsed = self.is_collapsed(&id);
             let collapse_id = id.clone();
             let toggle_id = id.clone();

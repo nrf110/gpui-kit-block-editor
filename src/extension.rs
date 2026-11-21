@@ -60,6 +60,7 @@ pub enum CommandAction {
     Editor(EditorCommand),
     InsertMarkdown(String),
     Collapsible,
+    CollapsibleList,
     InsertMedia(MediaKind),
 }
 
@@ -351,6 +352,17 @@ impl Default for CommandRegistry {
                 action: CommandAction::Collapsible,
             })
             .expect("the built-in collapsible command ID is unique");
+        registry
+            .register(SlashCommand {
+                id: "collapsible-list".into(),
+                title: "Collapsible list".into(),
+                group: "Lists".into(),
+                icon: IconName::ListCollapse,
+                description: "A list of expandable titles and nested content".into(),
+                keywords: vec!["toggle-list".into(), "disclosure".into(), "fold".into()],
+                action: CommandAction::CollapsibleList,
+            })
+            .expect("the built-in collapsible list command ID is unique");
         for (id, title, description, keywords, kind) in [
             (
                 "image",

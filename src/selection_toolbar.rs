@@ -23,44 +23,63 @@ pub(super) struct SelectionDropdown {
 }
 
 impl SelectionPanel {
-    fn choices(self) -> &'static [(&'static str, EditorCommand)] {
-        const STYLES: &[(&str, EditorCommand)] = &[
+    fn choices(self) -> &'static [(&'static str, CommandAction)] {
+        const STYLES: &[(&str, CommandAction)] = &[
             (
                 "Paragraph",
-                EditorCommand::SetBlockKind(NativeBlockKind::Paragraph),
+                CommandAction::Editor(EditorCommand::SetBlockKind(NativeBlockKind::Paragraph)),
             ),
             (
                 "Heading 1",
-                EditorCommand::SetBlockKind(NativeBlockKind::Heading { level: 1 }),
+                CommandAction::Editor(EditorCommand::SetBlockKind(NativeBlockKind::Heading {
+                    level: 1,
+                })),
             ),
             (
                 "Heading 2",
-                EditorCommand::SetBlockKind(NativeBlockKind::Heading { level: 2 }),
+                CommandAction::Editor(EditorCommand::SetBlockKind(NativeBlockKind::Heading {
+                    level: 2,
+                })),
             ),
             (
                 "Heading 3",
-                EditorCommand::SetBlockKind(NativeBlockKind::Heading { level: 3 }),
+                CommandAction::Editor(EditorCommand::SetBlockKind(NativeBlockKind::Heading {
+                    level: 3,
+                })),
             ),
             (
                 "Heading 4",
-                EditorCommand::SetBlockKind(NativeBlockKind::Heading { level: 4 }),
+                CommandAction::Editor(EditorCommand::SetBlockKind(NativeBlockKind::Heading {
+                    level: 4,
+                })),
             ),
             (
                 "Heading 5",
-                EditorCommand::SetBlockKind(NativeBlockKind::Heading { level: 5 }),
+                CommandAction::Editor(EditorCommand::SetBlockKind(NativeBlockKind::Heading {
+                    level: 5,
+                })),
             ),
             (
                 "Heading 6",
-                EditorCommand::SetBlockKind(NativeBlockKind::Heading { level: 6 }),
+                CommandAction::Editor(EditorCommand::SetBlockKind(NativeBlockKind::Heading {
+                    level: 6,
+                })),
             ),
         ];
-        const LISTS: &[(&str, EditorCommand)] = &[
+        const LISTS: &[(&str, CommandAction)] = &[
             (
                 "Bulleted list",
-                EditorCommand::ToggleList { ordered: false },
+                CommandAction::Editor(EditorCommand::ToggleList { ordered: false }),
             ),
-            ("Numbered list", EditorCommand::ToggleList { ordered: true }),
-            ("Task list", EditorCommand::ToggleTask),
+            (
+                "Numbered list",
+                CommandAction::Editor(EditorCommand::ToggleList { ordered: true }),
+            ),
+            (
+                "Task list",
+                CommandAction::Editor(EditorCommand::ToggleTask),
+            ),
+            ("Collapsible list", CommandAction::CollapsibleList),
         ];
         match self {
             Self::Styles => STYLES,
@@ -198,9 +217,10 @@ impl BlockEditor {
             .as_ref()
             .and_then(|parent| self.tree.get(parent));
         let checked = kind.choices().iter().position(|(_, command)| match command {
-            EditorCommand::SetBlockKind(target) => block_kind == Some(*target),
-            EditorCommand::ToggleList { ordered } => !task && list.is_some_and(|node| matches!(node.kind, SectionKind::List { ordered: current, .. } if current == *ordered)),
-            EditorCommand::ToggleTask => task,
+            CommandAction::Editor(EditorCommand::SetBlockKind(target)) => block_kind == Some(*target),
+            CommandAction::Editor(EditorCommand::ToggleList { ordered }) => !task && matches!(view.kind, SectionKind::ListItem { .. }) && list.is_some_and(|node| matches!(node.kind, SectionKind::List { ordered: current, .. } if current == *ordered)),
+            CommandAction::Editor(EditorCommand::ToggleTask) => task,
+            CommandAction::CollapsibleList => matches!(view.kind, SectionKind::CollapsibleListItem { .. }),
             _ => false,
         });
         let owner = cx.weak_entity();
@@ -216,12 +236,7 @@ impl BlockEditor {
                         .checked(checked == Some(index))
                         .on_click(move |_, window, cx| {
                             let _ = owner.update(cx, |this, cx| {
-                                this.run_selection_action(
-                                    &section,
-                                    CommandAction::Editor(command.clone()),
-                                    window,
-                                    cx,
-                                );
+                                this.run_selection_action(&section, command.clone(), window, cx);
                             });
                         }),
                 );
@@ -472,7 +487,7 @@ impl BlockEditor {
         let styles_disabled = matches!(kind, Some(NativeBlockKind::TableCell) | None);
         let quote_disabled = kind == Some(NativeBlockKind::TableCell);
         let collapsible_disabled = view.kind != SectionKind::Text;
-        let list_disabled = matches!(view.kind, SectionKind::Collapsible { .. }) || quote_disabled;
+        let list_disabled = quote_disabled;
         let section: Arc<str> = Arc::from(id.as_str());
         let style_label = match kind {
             Some(NativeBlockKind::Heading { level: 1 }) => "H1",

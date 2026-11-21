@@ -398,6 +398,7 @@ fn structural_toolbar_actions_retain_the_whole_block_and_children_in_one_undo(
         "selection-bulleted-list",
         "selection-ordered-list",
         "selection-task-list",
+        "selection-collapsible-list",
         "selection-collapsible",
     ] {
         cx.update_window(handle, |_, window, cx| {
@@ -410,7 +411,8 @@ fn structural_toolbar_actions_retain_the_whole_block_and_children_in_one_undo(
                     match action {
                         "selection-bulleted-list" => "Bulleted list",
                         "selection-ordered-list" => "Numbered list",
-                        _ => "Task list",
+                        "selection-task-list" => "Task list",
+                        _ => "Collapsible list",
                     },
                     cx,
                 );
@@ -450,8 +452,14 @@ fn structural_toolbar_actions_retain_the_whole_block_and_children_in_one_undo(
                     );
                     assert_eq!(
                         block.kind,
-                        SectionKind::ListItem {
-                            checked: (action == "selection-task-list").then_some(false),
+                        if action == "selection-collapsible-list" {
+                            SectionKind::CollapsibleListItem {
+                                default_collapsed: true,
+                            }
+                        } else {
+                            SectionKind::ListItem {
+                                checked: (action == "selection-task-list").then_some(false),
+                            }
                         }
                     );
                 }

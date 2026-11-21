@@ -1489,7 +1489,7 @@ fn empty_collapsible_gets_real_default_title_and_title_only_remains_valid() {
 }
 
 #[test]
-fn collapsible_batch_moves_keep_kind_subtree_and_reject_lists_atomically() {
+fn collapsible_batch_moves_keep_kind_subtree_and_reject_containers_atomically() {
     let mut document = Document::new();
     let title = document.insert_section(None, "Title").unwrap();
     let child = document.wrap_collapsible(&title).unwrap();
@@ -1500,17 +1500,24 @@ fn collapsible_batch_moves_keep_kind_subtree_and_reject_lists_atomically() {
         .insert_block(None, None, &list(false, 1, vec![item("entry", None)]))
         .unwrap();
     document.clear_history();
+    let original = document.sections();
+    document
+        .reparent_section(&title, Some(&group), None)
+        .unwrap();
+    assert_eq!(
+        document.children(Some(&group)).last().unwrap().kind,
+        SectionKind::CollapsibleListItem {
+            default_collapsed: true
+        }
+    );
+    assert_eq!(document.children(Some(&title))[0].id, child);
+    assert!(document.undo());
+    assert_eq!(document.sections(), original);
+    document.clear_history();
     let before = document.encode_state();
     assert!(
         document
-            .reparent_section(&title, Some(&group), None)
-            .is_err()
-    );
-    assert!(document.wrap_list(&title, false, false).is_err());
-    assert!(document.wrap_list(&title, true, true).is_err());
-    assert!(
-        document
-            .move_sections(&[title.clone()], Some(&group), None)
+            .move_sections(&[title.clone(), quote.clone()], Some(&group), None)
             .is_err()
     );
     assert_eq!(document.encode_state(), before);
@@ -1561,4 +1568,569 @@ fn quote_toggle_retains_collapsible_kind_title_and_descendants() {
         SectionKind::Collapsible { .. }
     ));
     assert_eq!(source(&document, &title), original);
+}
+
+fn disclosure_item(title: &str, default_collapsed: bool, children: Vec<BlockSpec>) -> BlockSpec {
+    BlockSpec {
+        kind: SectionKind::CollapsibleListItem { default_collapsed },
+        content: RichDocument::paragraph(title),
+        children,
+    }
+}
+
+#[test]
+fn collapsible_list_conversion_and_toggle_preserve_identity_subtrees_and_undo() {
+    let mut document = Document::new();
+    let title = document.insert_section(None, "**Title**").unwrap();
+    let child = document
+        .insert_block(Some(&title), None, &text("body"))
+        .unwrap();
+    let original = document.sections();
+    let original_source = source(&document, &title);
+    let title_node = node(&document, &title);
+    let anchor = document
+        .relative_position(&title, &title_node, 3, Assoc::After)
+        .unwrap();
+    document.clear_history();
+    document.wrap_collapsible_list(&title).unwrap();
+    let group = document.children(None)[0].id.clone();
+    assert_eq!(document.children(Some(&group))[0].id, title);
+    assert_eq!(document.children(Some(&title)).len(), 1);
+    assert_eq!(document.children(Some(&title))[0].id, child);
+    assert_eq!(source(&document, &title), original_source);
+    assert_eq!(node(&document, &title), title_node);
+    assert_eq!(document.resolve_position(&anchor).unwrap().2, 3);
+    assert!(document.undo());
+    assert_eq!(document.sections(), original);
+    assert!(!document.can_undo());
+    assert!(document.redo());
+    document
+        .set_kind(
+            &title,
+            SectionKind::CollapsibleListItem {
+                default_collapsed: false,
+            },
+        )
+        .unwrap();
+    document.clear_history();
+    let grouped = document.sections();
+    document.wrap_collapsible_list(&title).unwrap();
+    assert_eq!(document.children(None)[0].id, title);
+    assert_eq!(
+        document.children(None)[0].kind,
+        SectionKind::Collapsible {
+            default_collapsed: false
+        }
+    );
+    assert_eq!(document.children(Some(&title))[0].id, child);
+    assert!(document.undo());
+    assert_eq!(document.sections(), grouped);
+    assert!(!document.can_undo());
+}
+
+#[test]
+fn blank_collapsible_list_title_stays_blank_and_gets_one_typing_body() {
+    let mut document = Document::new();
+    let title = document.insert_section(None, "").unwrap();
+    let title_node = node(&document, &title);
+    document.clear_history();
+    document.wrap_collapsible_list(&title).unwrap();
+    let group = document.children(None)[0].id.clone();
+    let item = document.children(Some(&group))[0].clone();
+    assert_eq!(item.content.plain_text(), "");
+    assert_eq!(node(&document, &title), title_node);
+    let children = document.children(Some(&title));
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].kind, SectionKind::Text);
+    assert_eq!(children[0].content.plain_text(), "");
+    assert!(document.undo());
+    assert_eq!(document.sections().len(), 1);
+    assert!(!document.can_undo());
+}
+
+#[test]
+fn collapsible_list_split_inherits_disclosure_role_and_empty_enter_preserves_body() {
+    let mut document = Document::new();
+    let group = document
+        .insert_block(
+            None,
+            None,
+            &list(
+                false,
+                1,
+                vec![
+                    disclosure_item("title", false, vec![text("existing body")]),
+                    item("trailing", None),
+                ],
+            ),
+        )
+        .unwrap();
+    let title = document.children(Some(&group))[0].id.clone();
+    let body_id = document.children(Some(&title))[0].id.clone();
+    let title_node = node(&document, &title);
+    let paths = document
+        .replace_section(&title, &[text("title"), text("")])
+        .unwrap();
+    assert_eq!(paths.len(), 2);
+    assert_eq!(paths[0], (vec![0], title.clone()));
+    let next = paths[1].1.clone();
+    let items = document.children(Some(&group));
+    assert_eq!(items.len(), 3);
+    for item in &items[..2] {
+        assert_eq!(
+            item.kind,
+            SectionKind::CollapsibleListItem {
+                default_collapsed: false
+            }
+        );
+    }
+    assert_eq!(node(&document, &title), title_node);
+    assert_eq!(document.children(Some(&title))[0].id, body_id);
+    let next_body = document.children(Some(&next))[0].id.clone();
+    assert_eq!(document.children(Some(&next)).len(), 1);
+    edit_text(&mut document, &next_body, "keep this body").unwrap();
+    let before_exit = document.sections();
+    document.clear_history();
+    assert!(document.exit_list_item(&next).unwrap());
+    let roots = document.children(None);
+    assert_eq!(roots.len(), 3);
+    assert_eq!(roots[1].id, next);
+    assert_eq!(roots[1].kind, SectionKind::Text);
+    assert_eq!(document.children(Some(&next))[0].id, next_body);
+    assert_eq!(
+        document.children(Some(&next))[0].content.plain_text(),
+        "keep this body"
+    );
+    assert_eq!(
+        document.children(Some(&roots[2].id))[0]
+            .content
+            .plain_text(),
+        "trailing"
+    );
+    assert!(document.undo());
+    assert_eq!(document.sections(), before_exit);
+    assert!(!document.can_undo());
+}
+
+#[test]
+fn collapsible_list_converts_to_task_and_quote_without_losing_titles_or_children() {
+    let mut document = Document::new();
+    let group = document
+        .insert_block(
+            None,
+            None,
+            &list(
+                true,
+                7,
+                vec![item("ordinary", Some(true)), item("neighbor", None)],
+            ),
+        )
+        .unwrap();
+    let title = document.children(Some(&group))[0].id.clone();
+    let original_source = source(&document, &title);
+    document.wrap_collapsible_list(&title).unwrap();
+    assert_eq!(
+        document.children(None)[0].kind,
+        SectionKind::List {
+            ordered: false,
+            start: 1
+        }
+    );
+    assert_eq!(
+        document.children(Some(&group))[1].kind,
+        SectionKind::ListItem { checked: None }
+    );
+    let body_id = document.children(Some(&title))[0].id.clone();
+    document.wrap_quote(&title).unwrap();
+    let quote_id = document.children(None)[0].id.clone();
+    assert_eq!(document.children(None)[0].kind, SectionKind::Quote);
+    assert_eq!(document.children(Some(&quote_id))[0].id, group);
+    document.wrap_quote(&title).unwrap();
+    assert_eq!(document.children(None)[0].id, group);
+    document.wrap_list(&title, false, true).unwrap();
+    assert_eq!(
+        document.children(Some(&group))[0].kind,
+        SectionKind::ListItem {
+            checked: Some(false)
+        }
+    );
+    assert_eq!(document.children(Some(&title))[0].id, body_id);
+    assert_eq!(source(&document, &title), original_source);
+    document.wrap_collapsible_list(&title).unwrap();
+    document.wrap_list(&title, true, false).unwrap();
+    assert_eq!(
+        document.children(Some(&group))[0].kind,
+        SectionKind::ListItem { checked: None }
+    );
+    document.wrap_list(&title, true, false).unwrap();
+    document
+        .set_kind(
+            &title,
+            SectionKind::Collapsible {
+                default_collapsed: false,
+            },
+        )
+        .unwrap();
+    document.wrap_list(&title, false, true).unwrap();
+    let title_section = document
+        .sections()
+        .into_iter()
+        .find(|section| section.id == title)
+        .unwrap();
+    assert_eq!(
+        title_section.kind,
+        SectionKind::ListItem {
+            checked: Some(false)
+        }
+    );
+    assert_eq!(document.children(Some(&title))[0].id, body_id);
+}
+
+#[test]
+fn disclosure_drag_nest_outdent_and_reparent_preserve_folding_and_subtree() {
+    let mut document = Document::new();
+    let left = document
+        .insert_block(
+            None,
+            None,
+            &list(
+                false,
+                1,
+                vec![
+                    item("parent", None),
+                    disclosure_item("moving", false, vec![text("body")]),
+                ],
+            ),
+        )
+        .unwrap();
+    let moving = document.children(Some(&left))[1].id.clone();
+    let body_id = document.children(Some(&moving))[0].id.clone();
+    let original_source = source(&document, &moving);
+    assert!(document.indent_section(&moving).unwrap());
+    assert_eq!(
+        document
+            .sections()
+            .into_iter()
+            .find(|section| section.id == moving)
+            .unwrap()
+            .depth,
+        3
+    );
+    assert!(document.outdent_section(&moving).unwrap());
+    assert_eq!(document.children(Some(&left))[1].id, moving);
+    let right = document
+        .insert_block(None, None, &list(true, 4, vec![item("target", Some(true))]))
+        .unwrap();
+    document
+        .move_sections(std::slice::from_ref(&moving), Some(&right), None)
+        .unwrap();
+    assert_eq!(
+        document.children(Some(&right))[1].kind,
+        SectionKind::CollapsibleListItem {
+            default_collapsed: false
+        }
+    );
+    assert!(document.outdent_section(&moving).unwrap());
+    assert_eq!(
+        document.children(None).last().unwrap().kind,
+        SectionKind::Collapsible {
+            default_collapsed: false
+        }
+    );
+    document
+        .reparent_section(&moving, Some(&left), None)
+        .unwrap();
+    assert_eq!(
+        document.children(Some(&left))[1].kind,
+        SectionKind::CollapsibleListItem {
+            default_collapsed: false
+        }
+    );
+    document.reparent_section(&moving, None, None).unwrap();
+    assert_eq!(
+        document.children(None).last().unwrap().kind,
+        SectionKind::Collapsible {
+            default_collapsed: false
+        }
+    );
+    assert_eq!(document.children(Some(&moving))[0].id, body_id);
+    assert_eq!(source(&document, &moving), original_source);
+}
+
+#[test]
+fn removing_empty_disclosure_item_promotes_body_and_prunes_its_group() {
+    let mut document = Document::new();
+    let group = document
+        .insert_block(
+            None,
+            None,
+            &list(
+                false,
+                1,
+                vec![disclosure_item("", true, vec![text("keep body")])],
+            ),
+        )
+        .unwrap();
+    let title = document.children(Some(&group))[0].id.clone();
+    let child = document.children(Some(&title))[0].id.clone();
+    let before = document.sections();
+    document.clear_history();
+    assert!(document.remove_empty_block(&title).unwrap());
+    assert_eq!(ids(&document, None), [child]);
+    assert_eq!(document.children(None)[0].content.plain_text(), "keep body");
+    assert!(document.undo());
+    assert_eq!(document.sections(), before);
+}
+
+#[test]
+fn disclosure_items_roundtrip_json_markdown_and_raw_replication() {
+    let mut document = Document::new();
+    document
+        .insert_block(
+            None,
+            None,
+            &list(
+                false,
+                1,
+                vec![
+                    item("plain", None),
+                    disclosure_item("closed", true, vec![text("body")]),
+                    disclosure_item("", false, vec![text("")]),
+                ],
+            ),
+        )
+        .unwrap();
+    let json = document.export_json().unwrap();
+    assert!(json.contains("\"type\":\"collapsible_list_item\""));
+    assert_eq!(
+        Document::import_json(&json).unwrap().sections(),
+        document.sections()
+    );
+    let peer = replica(&document);
+    assert_eq!(peer.sections(), document.sections());
+    assert_eq!(peer.markdown(), document.markdown());
+    let markdown = document.markdown();
+    assert!(markdown.contains("- <details"));
+    let mut imported = Document::new();
+    imported.insert_section(None, &markdown).unwrap();
+    assert_eq!(imported.markdown(), markdown);
+    let kinds_and_text = |document: &Document| {
+        document
+            .sections()
+            .into_iter()
+            .map(|section| (section.kind, section.depth, section.content.plain_text()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(kinds_and_text(&imported), kinds_and_text(&document));
+}
+
+#[test]
+fn concurrent_disclosure_move_and_fold_changes_project_roles_without_repair_writes() {
+    let mut alice = Document::new();
+    let group = alice
+        .insert_block(
+            None,
+            None,
+            &list(
+                false,
+                1,
+                vec![
+                    disclosure_item("alpha", true, vec![text("alpha body")]),
+                    disclosure_item("beta", true, vec![text("beta body")]),
+                    item("guard", None),
+                ],
+            ),
+        )
+        .unwrap();
+    let items = alice.children(Some(&group));
+    let alpha = items[0].id.clone();
+    let beta = items[1].id.clone();
+    let mut bob = replica(&alice);
+    alice
+        .move_sections(std::slice::from_ref(&alpha), None, None)
+        .unwrap();
+    bob.set_kind(
+        &alpha,
+        SectionKind::CollapsibleListItem {
+            default_collapsed: false,
+        },
+    )
+    .unwrap();
+    bob.move_sections(std::slice::from_ref(&beta), None, None)
+        .unwrap();
+    alice
+        .set_kind(
+            &beta,
+            SectionKind::CollapsibleListItem {
+                default_collapsed: false,
+            },
+        )
+        .unwrap();
+    exchange(&mut alice, &mut bob);
+    let vector = alice.state_vector();
+    for id in [&alpha, &beta] {
+        let section = alice
+            .children(None)
+            .into_iter()
+            .find(|section| &section.id == id)
+            .unwrap();
+        assert!(matches!(section.kind, SectionKind::Collapsible { .. }));
+        assert_eq!(alice.children(Some(id)).len(), 1);
+    }
+    alice.markdown();
+    alice.export_json().unwrap();
+    assert_eq!(alice.state_vector(), vector);
+    assert_eq!(
+        Document::import_json(&alice.export_json().unwrap())
+            .unwrap()
+            .sections(),
+        alice.sections()
+    );
+}
+
+#[test]
+fn raw_disclosure_roles_follow_placement_in_both_directions_without_mutation() {
+    let mut document = Document::new();
+    let group = document
+        .insert_block(None, None, &list(false, 1, vec![item("guard", None)]))
+        .unwrap();
+    let title = document.insert_section(None, "Title").unwrap();
+    let child = document.wrap_collapsible(&title).unwrap();
+    {
+        let mut txn = document.doc.transact_mut_with(REMOTE_ORIGIN);
+        let map = document.section_map(&txn, &title).unwrap();
+        map.insert(
+            &mut txn,
+            "position",
+            placement(Some(&group), &fractional_between(None, None).unwrap()),
+        );
+    }
+    let vector = document.state_vector();
+    assert_eq!(
+        document
+            .children(Some(&group))
+            .iter()
+            .find(|section| section.id == title)
+            .unwrap()
+            .kind,
+        SectionKind::CollapsibleListItem {
+            default_collapsed: true
+        }
+    );
+    assert_eq!(document.state_vector(), vector);
+    assert_eq!(replica(&document).sections(), document.sections());
+    {
+        let mut txn = document.doc.transact_mut_with(REMOTE_ORIGIN);
+        let map = document.section_map(&txn, &title).unwrap();
+        map.insert(&mut txn, "kind", "collapsible-item:open");
+        map.insert(
+            &mut txn,
+            "position",
+            fractional_between(None, None).unwrap(),
+        );
+    }
+    let vector = document.state_vector();
+    assert_eq!(
+        document
+            .children(None)
+            .iter()
+            .find(|section| section.id == title)
+            .unwrap()
+            .kind,
+        SectionKind::Collapsible {
+            default_collapsed: false
+        }
+    );
+    assert_eq!(document.children(Some(&title))[0].id, child);
+    assert_eq!(replica(&document).sections(), document.sections());
+    assert_eq!(document.state_vector(), vector);
+}
+
+#[test]
+fn standalone_disclosure_adopts_list_role_without_adding_another_body() {
+    let mut document = Document::new();
+    let title = document.insert_section(None, "Title").unwrap();
+    let child = document.wrap_collapsible(&title).unwrap();
+    document
+        .set_kind(
+            &title,
+            SectionKind::Collapsible {
+                default_collapsed: false,
+            },
+        )
+        .unwrap();
+    let before = document.sections();
+    let original_source = source(&document, &title);
+    document.clear_history();
+    document.wrap_collapsible_list(&title).unwrap();
+    let group = document.children(None)[0].id.clone();
+    assert_eq!(
+        document.children(Some(&group))[0].kind,
+        SectionKind::CollapsibleListItem {
+            default_collapsed: false
+        }
+    );
+    assert_eq!(ids(&document, Some(&title)), [child]);
+    assert_eq!(source(&document, &title), original_source);
+    assert!(document.undo());
+    assert_eq!(document.sections(), before);
+    assert!(!document.can_undo());
+}
+
+#[test]
+fn disclosure_list_validation_and_replacement_keep_native_item_boundaries() {
+    let mut document = Document::new();
+    assert!(
+        document
+            .insert_block(None, None, &disclosure_item("orphan", true, vec![]))
+            .is_err()
+    );
+    let group = document
+        .insert_block(
+            None,
+            None,
+            &list(
+                false,
+                1,
+                vec![disclosure_item("title", true, vec![]), item("plain", None)],
+            ),
+        )
+        .unwrap();
+    let title = document.children(Some(&group))[0].id.clone();
+    let before = document.encode_state();
+    assert!(
+        document
+            .insert_block(Some(&group), None, &quote(vec![text("invalid")]))
+            .is_err()
+    );
+    assert!(document.set_kind(&title, SectionKind::Quote).is_err());
+    assert_eq!(document.encode_state(), before);
+    let replacement = BlockSpec {
+        kind: SectionKind::Collapsible {
+            default_collapsed: false,
+        },
+        content: RichDocument::paragraph("replacement"),
+        children: vec![text("replacement body")],
+    };
+    let paths = document.replace_section(&title, &[replacement]).unwrap();
+    assert_eq!(paths[0], (vec![0], title.clone()));
+    assert_eq!(
+        document.children(Some(&group))[0].kind,
+        SectionKind::CollapsibleListItem {
+            default_collapsed: false
+        }
+    );
+    assert_eq!(
+        document.children(Some(&title))[0].content.plain_text(),
+        "replacement body"
+    );
+    let mut json: serde_json::Value =
+        serde_json::from_str(&document.export_json().unwrap()).unwrap();
+    let sections = json["sections"].as_array_mut().unwrap();
+    let title_section = sections
+        .iter_mut()
+        .find(|section| section["id"].as_str() == Some(title.as_str()))
+        .unwrap();
+    title_section["parent"] = serde_json::Value::Null;
+    assert!(Document::import_json(&serde_json::to_string(&json).unwrap()).is_err());
 }

@@ -278,9 +278,7 @@ impl BlockEditor {
                     )?;
                 }
                 let view = &self.views[&section];
-                if !matches!(view.kind, SectionKind::Collapsible { .. })
-                    && empty_text(&view.content)
-                {
+                if view.kind.default_collapsed().is_none() && empty_text(&view.content) {
                     replacement = Some(section);
                 }
             }

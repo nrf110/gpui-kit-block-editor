@@ -35,6 +35,8 @@ struct Draft {
     body: Body,
     span: Range<usize>,
     children: Vec<Draft>,
+    // Disclosure children have already resolved references in their own source.
+    local_context: bool,
 }
 
 impl Draft {
@@ -44,6 +46,7 @@ impl Draft {
             body: Body::default(),
             span,
             children: Vec::new(),
+            local_context: false,
         }
     }
     fn finish(self) -> Result<BlockSpec> {
@@ -571,6 +574,9 @@ fn details_draft(
     } else if has_children {
         draft.children.push(Draft::empty(SectionKind::Text, 0..0));
     }
+    for child in &mut draft.children {
+        child.local_context = true;
+    }
     Ok(Some((draft, end)))
 }
 
@@ -579,6 +585,25 @@ fn span(node: &Node) -> Result<Range<usize>> {
         .position()
         .context("Markdown AST node has no source position")?;
     Ok(position.start.offset..position.end.offset)
+}
+
+fn trailing_drafts(
+    source: &str,
+    range: Range<usize>,
+    containers: &[Container],
+    reference_context: &str,
+) -> Result<Vec<Draft>> {
+    let mut trailing = Body::default();
+    copy_deindented(&mut trailing, source, range, containers);
+    let trailing = trailing.markdown.trim_matches(['\r', '\n']);
+    if trailing.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut drafts = drafts_with_context(trailing, reference_context)?;
+    for draft in &mut drafts {
+        draft.local_context = true;
+    }
+    Ok(drafts)
 }
 
 fn collect_children(
@@ -595,6 +620,18 @@ fn collect_children(
         for child in children {
             let range = span(child)?;
             if range.start < consumed_until {
+                // The closing HTML node can also contain text after </details>.
+                // Only the prefix was consumed by the disclosure parser.
+                if range.end > consumed_until {
+                    blocks.extend(trailing_drafts(
+                        source,
+                        consumed_until..range.end,
+                        containers,
+                        reference_context,
+                    )?);
+                    previous_end = range.end;
+                    consumed_until = range.end;
+                }
                 continue;
             }
             if matches!(node, Node::Root(_)) {
@@ -634,12 +671,12 @@ fn collect_children(
                 consumed_until = end;
                 previous_end = end;
                 if range.end > end {
-                    let mut trailing = Body::default();
-                    copy_deindented(&mut trailing, source, end..range.end, containers);
-                    let trailing = trailing.markdown.trim_matches(['\r', '\n']);
-                    if !trailing.is_empty() {
-                        blocks.extend(drafts_with_context(trailing, reference_context)?);
-                    }
+                    blocks.extend(trailing_drafts(
+                        source,
+                        end..range.end,
+                        containers,
+                        reference_context,
+                    )?);
                     previous_end = range.end;
                     consumed_until = range.end;
                 }
@@ -680,6 +717,18 @@ fn collect(
             let mut nested = containers.to_vec();
             nested.push(Container::Item(item_indent(&source[range.clone()])));
             let mut children = collect_children(source, node, &nested, reference_context)?;
+            if let Some(SectionKind::Collapsible { default_collapsed }) =
+                children.first().map(|child| &child.kind)
+            {
+                let kind = SectionKind::CollapsibleListItem {
+                    default_collapsed: *default_collapsed,
+                };
+                let mut draft = children.remove(0);
+                draft.kind = kind;
+                draft.span = range;
+                draft.children.extend(children);
+                return Ok(vec![draft]);
+            }
             let inferred_checked = if item.checked.is_none() {
                 children
                     .first()
@@ -990,6 +1039,9 @@ fn preserve_reference_context(root: &Node, drafts: &mut Vec<Draft>) -> Result<()
     }
     fn definition_body<'a>(drafts: &'a [Draft], range: &Range<usize>) -> Option<&'a str> {
         for draft in drafts {
+            if draft.local_context {
+                continue;
+            }
             if is_definition(draft, range) {
                 return Some(&draft.body.markdown);
             }
@@ -1005,7 +1057,10 @@ fn preserve_reference_context(root: &Node, drafts: &mut Vec<Draft>) -> Result<()
         definitions: &[(&str, String)],
     ) {
         for draft in drafts {
-            if draft.kind.is_editable() && !matches!(draft.kind, SectionKind::Collapsible { .. }) {
+            if draft.local_context {
+                continue;
+            }
+            if draft.kind.is_editable() && draft.kind.default_collapsed().is_none() {
                 for (identifier, definition) in definitions {
                     if references.iter().any(|(reference, range)| {
                         reference == identifier
@@ -1017,22 +1072,21 @@ fn preserve_reference_context(root: &Node, drafts: &mut Vec<Draft>) -> Result<()
                     }
                 }
             }
-            if !matches!(draft.kind, SectionKind::Collapsible { .. }) {
-                append(&mut draft.children, references, definitions);
-            }
+            append(&mut draft.children, references, definitions);
         }
     }
     fn strip(drafts: &mut Vec<Draft>, ranges: &[Range<usize>]) {
         drafts.retain_mut(|draft| {
+            if draft.local_context {
+                return true;
+            }
             if ranges.iter().any(|range| is_definition(draft, range)) {
                 if draft.kind == SectionKind::Text {
                     return false;
                 }
                 draft.body = Body::default();
             }
-            if !matches!(draft.kind, SectionKind::Collapsible { .. }) {
-                strip(&mut draft.children, ranges);
-            }
+            strip(&mut draft.children, ranges);
             if draft.kind == SectionKind::Quote && draft.children.is_empty() {
                 draft
                     .children
@@ -1579,5 +1633,243 @@ mod tests {
         assert_eq!(link.url, "https://example.test");
         assert_eq!(link.title.as_deref(), Some("title"));
         assert_eq!(parsed.blocks[2].content.plain_text(), "after");
+    }
+
+    #[test]
+    fn initial_disclosures_become_collapsible_list_items() {
+        for open in ["", " open"] {
+            let source = format!(
+                "- <details{open}>\n  <summary>A &amp; <strong>B</strong></summary>\n\n  body\n\n  </details>\n- ordinary"
+            );
+            let parsed = parse_blocks(&source).unwrap();
+            assert_eq!(parsed.blocks.len(), 1);
+            let list = &parsed.blocks[0];
+            assert_eq!(list.children.len(), 2);
+            let item = &list.children[0];
+            assert_eq!(
+                item.kind,
+                SectionKind::CollapsibleListItem {
+                    default_collapsed: open.is_empty(),
+                }
+            );
+            assert_eq!(item.content.plain_text(), "A & B");
+            assert!(item.content.blocks[0].runs.last().unwrap().marks.bold);
+            assert_eq!(item.children.len(), 1);
+            assert_eq!(item.children[0].content.plain_text(), "body");
+            assert_eq!(
+                list.children[1].kind,
+                SectionKind::ListItem { checked: None }
+            );
+            assert_eq!(list.children[1].content.plain_text(), "ordinary");
+        }
+    }
+
+    #[test]
+    fn disclosure_list_items_keep_body_and_trailing_item_children() {
+        let source = "- <details>\n  <summary>Title</summary>\n\n  body\n\n  </details>\n\n  after\n\n  - nested\n- sibling";
+        let parsed = parse_blocks(source).unwrap();
+        let item = block_at(&parsed, &[0, 0]);
+        assert!(matches!(item.kind, SectionKind::CollapsibleListItem { .. }));
+        assert_eq!(item.content.plain_text(), "Title");
+        assert_eq!(item.children.len(), 3);
+        assert_eq!(item.children[0].content.plain_text(), "body");
+        assert_eq!(item.children[1].content.plain_text(), "after");
+        assert!(matches!(item.children[2].kind, SectionKind::List { .. }));
+        assert_eq!(item.children[2].children[0].content.plain_text(), "nested");
+        assert_eq!(block_at(&parsed, &[0, 1]).content.plain_text(), "sibling");
+
+        // CommonMark can include the trailing text in the HTML AST node itself.
+        for source in [
+            "- <details><summary>Title</summary>body</details>\n  after",
+            "- <details>\n  <summary>Title</summary>\n\n  body\n\n  </details>\n  after",
+        ] {
+            let parsed = parse_blocks(source).unwrap();
+            let item = block_at(&parsed, &[0, 0]);
+            assert_eq!(item.children.len(), 2, "{source:?}");
+            assert_eq!(item.children[0].content.plain_text(), "body");
+            assert_eq!(item.children[1].content.plain_text(), "after");
+        }
+    }
+
+    #[test]
+    fn disclosure_list_references_keep_summary_body_and_trailing_scope() {
+        for separator in ["\n", "\n\n"] {
+            let source = format!(
+                "- <details open>\n  <summary>**[Title][id]**</summary>\n\n  [body][id]\n\n  </details>{separator}  [after][id]\n- [sibling][id]\n\n[id]: https://example.test \"reference\""
+            );
+            let parsed = parse_blocks(&source).unwrap();
+            let item = block_at(&parsed, &[0, 0]);
+            assert_eq!(item.content.plain_text(), "Title");
+            assert!(item.content.blocks[0].runs[0].marks.bold);
+            assert_eq!(item.children.len(), 2);
+            assert_eq!(item.children[0].content.plain_text(), "body");
+            assert_eq!(item.children[1].content.plain_text(), "after");
+            for content in [
+                &item.content,
+                &item.children[0].content,
+                &item.children[1].content,
+                &block_at(&parsed, &[0, 1]).content,
+            ] {
+                let link = content.blocks[0].runs[0].marks.link.as_ref().unwrap();
+                assert_eq!(link.url, "https://example.test");
+                assert_eq!(link.title.as_deref(), Some("reference"));
+                assert!(content.blocks.iter().any(|node| {
+                    node.kind == RichKind::Definition && node.attrs["identifier"] == "id"
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn native_disclosure_lists_keep_rich_summaries_and_nested_mixed_groups() {
+        let title =
+            RichDocument::from_markdown("**Rich** `title` [link](https://example.test)").unwrap();
+        let nested = collapsible_markdown(&RichDocument::paragraph("inner"), "inside", false, 1);
+        let nested_item = format!("- {}", nested.replace('\n', "\n  "));
+        let body = format!("- ordinary\n{nested_item}");
+        let disclosure = collapsible_markdown(&title, &body, true, 1);
+        let source = format!("> 3. {}\n> 4. last", disclosure.replace('\n', "\n>    "));
+        let parsed = parse_blocks(&source).unwrap();
+        let list = block_at(&parsed, &[0, 0]);
+        assert_eq!(
+            list.kind,
+            SectionKind::List {
+                ordered: true,
+                start: 3,
+            }
+        );
+        assert_eq!(list.children.len(), 2);
+        let outer = &list.children[0];
+        assert_eq!(
+            outer.kind,
+            SectionKind::CollapsibleListItem {
+                default_collapsed: true,
+            }
+        );
+        assert_eq!(outer.content.plain_text(), title.plain_text());
+        assert!(outer.content.blocks[0].runs[0].marks.bold);
+        assert!(
+            outer.content.blocks[0]
+                .runs
+                .iter()
+                .any(|run| run.marks.code)
+        );
+        assert!(
+            outer.content.blocks[0]
+                .runs
+                .iter()
+                .any(|run| run.marks.link.is_some())
+        );
+        assert_eq!(outer.children.len(), 1);
+        let nested_list = &outer.children[0];
+        assert!(matches!(nested_list.kind, SectionKind::List { .. }));
+        assert_eq!(nested_list.children.len(), 2);
+        assert_eq!(
+            nested_list.children[0].kind,
+            SectionKind::ListItem { checked: None }
+        );
+        assert_eq!(
+            nested_list.children[1].kind,
+            SectionKind::CollapsibleListItem {
+                default_collapsed: false,
+            }
+        );
+        assert_eq!(nested_list.children[1].content.plain_text(), "inner");
+        assert_eq!(
+            nested_list.children[1].children[0].content.plain_text(),
+            "inside"
+        );
+        assert_eq!(list.children[1].content.plain_text(), "last");
+    }
+
+    #[test]
+    fn disclosure_list_empty_titles_and_typing_bodies_remain_distinct() {
+        for collapsed in [false, true] {
+            for count in [0, 1] {
+                let disclosure =
+                    collapsible_markdown(&RichDocument::paragraph(""), "", collapsed, count);
+                let parsed =
+                    parse_blocks(&format!("- {}", disclosure.replace('\n', "\n  "))).unwrap();
+                let item = block_at(&parsed, &[0, 0]);
+                assert_eq!(
+                    item.kind,
+                    SectionKind::CollapsibleListItem {
+                        default_collapsed: collapsed,
+                    }
+                );
+                assert_eq!(item.content.plain_text(), "");
+                assert_eq!(item.children.len(), count);
+                if count > 0 {
+                    assert_eq!(item.children[0].kind, SectionKind::Text);
+                    assert_eq!(item.children[0].content.plain_text(), "");
+                }
+            }
+        }
+        let parsed = parse_blocks("- <details><summary></summary></details>").unwrap();
+        let item = block_at(&parsed, &[0, 0]);
+        assert!(matches!(item.kind, SectionKind::CollapsibleListItem { .. }));
+        assert_eq!(item.content.plain_text(), "");
+        assert!(item.children.is_empty());
+    }
+
+    #[test]
+    fn ordinary_list_titles_keep_nested_standalone_disclosures() {
+        let parsed = parse_blocks(
+            "- ordinary\n\n  <details>\n  <summary>nested</summary>\n\n  body\n\n  </details>\n- sibling",
+        )
+        .unwrap();
+        let item = block_at(&parsed, &[0, 0]);
+        assert_eq!(item.kind, SectionKind::ListItem { checked: None });
+        assert_eq!(item.content.plain_text(), "ordinary");
+        assert_eq!(item.children.len(), 1);
+        assert_eq!(
+            item.children[0].kind,
+            SectionKind::Collapsible {
+                default_collapsed: true,
+            }
+        );
+        assert_eq!(item.children[0].content.plain_text(), "nested");
+        assert_eq!(item.children[0].children[0].content.plain_text(), "body");
+        assert_eq!(block_at(&parsed, &[0, 1]).content.plain_text(), "sibling");
+    }
+
+    #[test]
+    fn document_disclosure_lists_roundtrip_without_blank_wrappers() {
+        let nested = collapsible_markdown(&RichDocument::paragraph("inner"), "", true, 1);
+        let body = format!("- ordinary\n- {}", nested.replace('\n', "\n  "));
+        let title = RichDocument::from_markdown("**Title** [link](https://example.test)").unwrap();
+        let disclosure = collapsible_markdown(&title, &body, false, 1);
+        let source = format!("- {}\n- sibling", disclosure.replace('\n', "\n  "));
+        let mut document = crate::document::Document::new();
+        document.insert_section(None, &source).unwrap();
+        let markdown = document.markdown();
+        let mut restored = crate::document::Document::new();
+        restored.insert_section(None, &markdown).unwrap();
+        let shape = |document: &crate::document::Document| {
+            document
+                .sections()
+                .into_iter()
+                .map(|section| (section.depth, section.kind, section.content.plain_text()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(&document), shape(&restored));
+        assert_eq!(restored.markdown(), markdown);
+        let sections = restored.sections();
+        assert_eq!(
+            sections
+                .iter()
+                .filter(|section| matches!(section.kind, SectionKind::CollapsibleListItem { .. }))
+                .count(),
+            2
+        );
+        let outer = &sections[1];
+        assert_eq!(outer.content.plain_text(), title.plain_text());
+        assert!(outer.content.blocks[0].runs[0].marks.bold);
+        assert!(
+            outer.content.blocks[0]
+                .runs
+                .iter()
+                .any(|run| run.marks.link.is_some())
+        );
     }
 }

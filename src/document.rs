@@ -283,10 +283,7 @@ impl Document {
         };
         for spec in &blocks {
             validate_spec(spec)?;
-            ensure!(
-                !matches!(spec.kind, SectionKind::ListItem { .. }),
-                "list items require a list group"
-            );
+            ensure!(!spec.kind.is_list_item(), "list items require a list group");
         }
         ensure!(
             blocks.iter().any(has_editable),
@@ -474,7 +471,17 @@ impl Document {
             let entries = document.entries(&txn);
             let entry = find_entry(&entries, id)?;
             validate_placement(&entries, parent, before, Some(id))?;
-            validate_child(&entries, parent, &entry.kind)?;
+            let into_list = parent.is_some_and(|id| {
+                entries
+                    .iter()
+                    .any(|entry| entry.id == id && matches!(entry.kind, SectionKind::List { .. }))
+            });
+            let kind = if entry.kind.default_collapsed().is_some() {
+                list_role(&entry.kind, into_list, false)
+            } else {
+                entry.kind.clone()
+            };
+            validate_child(&entries, parent, &kind)?;
             if before == Some(id) {
                 ensure!(
                     entry.parent.as_deref() == parent,
@@ -483,6 +490,11 @@ impl Document {
                 return Ok(());
             }
             let position = sibling_position(&entries, parent, before, Some(id))?;
+            if kind != entry.kind {
+                document
+                    .section_map(&txn, id)?
+                    .insert(&mut txn, "kind", encode_kind(&kind));
+            }
             document.section_map(&txn, id)?.insert(
                 &mut txn,
                 "position",
@@ -562,13 +574,7 @@ impl Document {
             let mut moves: Vec<(&Entry, MapRef, SectionKind, String)> =
                 Vec::with_capacity(roots.len());
             for entry in roots {
-                let kind = match (&entry.kind, target_is_list) {
-                    (SectionKind::Text, true) => SectionKind::ListItem {
-                        checked: target_is_task.then_some(false),
-                    },
-                    (SectionKind::ListItem { .. }, false) => SectionKind::Text,
-                    _ => entry.kind.clone(),
-                };
+                let kind = list_role(&entry.kind, target_is_list, target_is_task);
                 validate_child(&entries, parent, &kind)?;
                 let position = fractional_between(
                     moves.last().map(|moving| moving.3.as_str()).or(lower),
@@ -616,7 +622,7 @@ impl Document {
             return Ok(false);
         };
         self.command(|document| {
-            if matches!(section.kind, SectionKind::ListItem { .. }) {
+            if section.kind.is_list_item() {
                 let group = sections
                     .iter()
                     .find(|other| Some(&other.id) == section.parent.as_ref())
@@ -663,13 +669,11 @@ impl Document {
             .iter()
             .find(|other| &other.id == parent_id)
             .unwrap();
-        if matches!(section.kind, SectionKind::ListItem { .. }) {
+        if section.kind.is_list_item() {
             let owner = sections
                 .iter()
                 .find(|other| Some(&other.id) == parent.parent.as_ref());
-            let Some(owner) =
-                owner.filter(|owner| matches!(owner.kind, SectionKind::ListItem { .. }))
-            else {
+            let Some(owner) = owner.filter(|owner| owner.kind.is_list_item()) else {
                 return self.lift_list_item(id, false);
             };
             let before = next_sibling(&sections, &owner.id);
@@ -703,8 +707,7 @@ impl Document {
             .iter()
             .find(|section| section.id == id)
             .ok_or_else(|| anyhow!("unknown section: {id}"))?;
-        if !matches!(item.kind, SectionKind::ListItem { .. })
-            || (empty_only && !item.content.plain_text().trim().is_empty())
+        if !item.kind.is_list_item() || (empty_only && !item.content.plain_text().trim().is_empty())
         {
             return Ok(false);
         }
@@ -730,7 +733,12 @@ impl Document {
                 let position =
                     sibling_position(&entries, group.parent.as_deref(), before.as_deref(), None)?;
                 let map = document.section_map(&txn, id)?;
-                map.insert(&mut txn, "kind", encode_kind(&SectionKind::Text));
+                let kind = if empty_only {
+                    SectionKind::Text
+                } else {
+                    list_role(&item.kind, false, false)
+                };
+                map.insert(&mut txn, "kind", encode_kind(&kind));
                 map.insert(
                     &mut txn,
                     "position",
@@ -821,12 +829,17 @@ impl Document {
             .iter()
             .find(|section| section.id == id)
             .ok_or_else(|| anyhow!("unknown section: {id}"))?;
-        if let SectionKind::ListItem { checked } = item.kind {
+        if item.kind.is_list_item() {
             let group = sections
                 .iter()
                 .find(|section| Some(&section.id) == item.parent.as_ref())
                 .unwrap();
-            if matches!(group.kind, SectionKind::List { ordered: current, .. } if current == ordered)
+            let checked = match item.kind {
+                SectionKind::ListItem { checked } => checked,
+                _ => None,
+            };
+            if matches!(item.kind, SectionKind::ListItem { .. })
+                && matches!(group.kind, SectionKind::List { ordered: current, .. } if current == ordered)
                 && checked.is_some() == task
             {
                 self.lift_list_item(id, false)?;
@@ -847,7 +860,10 @@ impl Document {
             });
         }
         ensure!(
-            item.kind == SectionKind::Text,
+            matches!(
+                item.kind,
+                SectionKind::Text | SectionKind::Collapsible { .. }
+            ),
             "only editable text can become a list"
         );
         self.command(|document| {
@@ -885,7 +901,7 @@ impl Document {
             .iter()
             .find(|section| section.id == id)
             .ok_or_else(|| anyhow!("unknown section: {id}"))?;
-        if matches!(section.kind, SectionKind::ListItem { .. }) {
+        if section.kind.is_list_item() {
             section = sections
                 .iter()
                 .find(|other| Some(&other.id) == section.parent.as_ref())
@@ -926,6 +942,77 @@ impl Document {
                     },
                 )?;
                 document.reparent_section(id, Some(&quote), None)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Toggle an editable title into a disclosure item, retaining its identity.
+    /// Reapplying lifts it out as a standalone disclosure with the same body.
+    pub fn wrap_collapsible_list(&mut self, id: &str) -> Result<()> {
+        let sections = self.sections();
+        let item = sections
+            .iter()
+            .find(|section| section.id == id)
+            .ok_or_else(|| anyhow!("unknown section: {id}"))?;
+        ensure!(
+            item.kind.is_editable(),
+            "only editable text can become a collapsible list"
+        );
+        if matches!(item.kind, SectionKind::CollapsibleListItem { .. }) {
+            self.lift_list_item(id, false)?;
+            return Ok(());
+        }
+        let kind = SectionKind::CollapsibleListItem {
+            default_collapsed: item.kind.default_collapsed().unwrap_or(true),
+        };
+        self.command(|document| {
+            if item.kind.is_list_item() {
+                document.set_kind(
+                    item.parent
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("list item has no list"))?,
+                    SectionKind::List {
+                        ordered: false,
+                        start: 1,
+                    },
+                )?;
+                document.set_kind(id, kind)?;
+            } else {
+                let group = document.insert_block(
+                    item.parent.as_deref(),
+                    Some(id),
+                    &BlockSpec {
+                        kind: SectionKind::List {
+                            ordered: false,
+                            start: 1,
+                        },
+                        content: RichDocument::default(),
+                        children: vec![],
+                    },
+                )?;
+                let mut txn = document.doc.transact_mut_with(LOCAL_ORIGIN);
+                let map = document.section_map(&txn, id)?;
+                map.insert(&mut txn, "kind", encode_kind(&kind));
+                map.insert(
+                    &mut txn,
+                    "position",
+                    placement(Some(&group), &fractional_between(None, None)?),
+                );
+            }
+            if !sections
+                .iter()
+                .any(|section| section.parent.as_deref() == Some(id))
+            {
+                document.insert_block(
+                    Some(id),
+                    None,
+                    &BlockSpec {
+                        kind: SectionKind::Text,
+                        content: RichDocument::paragraph(""),
+                        children: vec![],
+                    },
+                )?;
             }
             Ok(())
         })
@@ -1011,10 +1098,7 @@ impl Document {
                     .ok_or_else(|| anyhow!("missing section parent"))?;
                 validate_kind_child(&owner.kind, &section.kind)?;
             } else {
-                ensure!(
-                    !matches!(section.kind, SectionKind::ListItem { .. }),
-                    "root list item"
-                );
+                ensure!(!section.kind.is_list_item(), "root list item");
             }
             let mut visited = HashSet::new();
             let mut ancestor = Some(section.id.as_str());
@@ -1083,7 +1167,19 @@ impl Document {
             SectionKind::ListItem { checked } => checked,
             _ => None,
         };
-        let in_list = matches!(old.kind, SectionKind::ListItem { .. });
+        let in_list = old.kind.is_list_item();
+        let inherited_kind = |index| match old.kind {
+            SectionKind::CollapsibleListItem { default_collapsed } => {
+                SectionKind::CollapsibleListItem { default_collapsed }
+            }
+            _ => SectionKind::ListItem {
+                checked: if index == 0 {
+                    checked
+                } else {
+                    checked.map(|_| false)
+                },
+            },
+        };
         let flatten_list = in_list
             && input.len() == 1
             && matches!(input[0].kind, SectionKind::List { .. })
@@ -1108,15 +1204,11 @@ impl Document {
                 let mut spec = input;
                 let mut normalized = vec![index];
                 if in_list && spec.kind == SectionKind::Text {
-                    spec.kind = SectionKind::ListItem {
-                        checked: if index == 0 {
-                            checked
-                        } else {
-                            checked.map(|_| false)
-                        },
-                    };
+                    spec.kind = inherited_kind(index);
+                } else if in_list && matches!(spec.kind, SectionKind::Collapsible { .. }) {
+                    spec.kind = list_role(&spec.kind, true, false);
                 }
-                let wrap = in_list && !matches!(spec.kind, SectionKind::ListItem { .. });
+                let wrap = in_list && !spec.kind.is_list_item();
                 if wrap {
                     normalized.push(0);
                 }
@@ -1127,15 +1219,22 @@ impl Document {
                     &mut translations,
                     &mut reuse_path,
                 );
+                if matches!(spec.kind, SectionKind::CollapsibleListItem { .. })
+                    && spec.children.is_empty()
+                    && (index != 0
+                        || !sections
+                            .iter()
+                            .any(|section| section.parent.as_deref() == Some(id)))
+                {
+                    spec.children.push(BlockSpec {
+                        kind: SectionKind::Text,
+                        content: RichDocument::paragraph(""),
+                        children: vec![],
+                    });
+                }
                 specs.push(if wrap {
                     BlockSpec {
-                        kind: SectionKind::ListItem {
-                            checked: if index == 0 {
-                                checked
-                            } else {
-                                checked.map(|_| false)
-                            },
-                        },
+                        kind: inherited_kind(index),
                         content: RichDocument::paragraph(""),
                         children: vec![spec],
                     }
@@ -1241,7 +1340,9 @@ impl Document {
             .ok_or_else(|| anyhow!("unknown section: {id}"))?;
         if !matches!(
             section.kind,
-            SectionKind::Text | SectionKind::ListItem { .. }
+            SectionKind::Text
+                | SectionKind::ListItem { .. }
+                | SectionKind::CollapsibleListItem { .. }
         ) || !section.content.blocks.iter().all(|node| {
             matches!(node.kind, RichKind::Paragraph | RichKind::Heading)
                 && node.children.is_empty()
@@ -1252,7 +1353,7 @@ impl Document {
         }) {
             return Ok(false);
         }
-        let in_list = matches!(section.kind, SectionKind::ListItem { .. });
+        let in_list = section.kind.is_list_item();
         if sections
             .iter()
             .filter(|section| section.kind.is_editable())
@@ -1589,7 +1690,7 @@ fn validate_placement(
 
 fn validate_kind_child(parent: &SectionKind, child: &SectionKind) -> Result<()> {
     ensure!(
-        matches!(parent, SectionKind::List { .. }) == matches!(child, SectionKind::ListItem { .. }),
+        matches!(parent, SectionKind::List { .. }) == child.is_list_item(),
         "list groups contain only list items, and list items require a list group"
     );
     Ok(())
@@ -1599,10 +1700,7 @@ fn validate_child(entries: &[Entry], parent: Option<&str>, kind: &SectionKind) -
     match parent {
         Some(parent) => validate_kind_child(&find_entry(entries, parent)?.kind, kind),
         None => {
-            ensure!(
-                !matches!(kind, SectionKind::ListItem { .. }),
-                "list items require a list group"
-            );
+            ensure!(!kind.is_list_item(), "list items require a list group");
             Ok(())
         }
     }
@@ -1682,6 +1780,27 @@ fn next_sibling(sections: &[Section], id: &str) -> Option<SectionId> {
         .map(|section| section.id.clone())
 }
 
+/// Placement determines list role; disclosure state survives either direction.
+fn list_role(kind: &SectionKind, into_list: bool, task: bool) -> SectionKind {
+    match (kind, into_list) {
+        (SectionKind::Text, true) => SectionKind::ListItem {
+            checked: task.then_some(false),
+        },
+        (SectionKind::ListItem { .. }, false) => SectionKind::Text,
+        (SectionKind::Collapsible { default_collapsed }, true) => {
+            SectionKind::CollapsibleListItem {
+                default_collapsed: *default_collapsed,
+            }
+        }
+        (SectionKind::CollapsibleListItem { default_collapsed }, false) => {
+            SectionKind::Collapsible {
+                default_collapsed: *default_collapsed,
+            }
+        }
+        _ => kind.clone(),
+    }
+}
+
 // Kind is one register too: an ordered list's flag and starting number cannot
 // tear under concurrent list-type changes.
 fn encode_kind(kind: &SectionKind) -> String {
@@ -1690,6 +1809,10 @@ fn encode_kind(kind: &SectionKind) -> String {
         SectionKind::Quote => "quote".to_owned(),
         SectionKind::Collapsible { default_collapsed } => format!(
             "collapsible:{}",
+            if *default_collapsed { "closed" } else { "open" }
+        ),
+        SectionKind::CollapsibleListItem { default_collapsed } => format!(
+            "collapsible-item:{}",
             if *default_collapsed { "closed" } else { "open" }
         ),
         SectionKind::List { ordered, start } => format!(
@@ -1714,6 +1837,12 @@ fn read_kind<T: ReadTxn>(map: &MapRef, txn: &T) -> SectionKind {
             default_collapsed: false,
         },
         "collapsible:closed" => SectionKind::Collapsible {
+            default_collapsed: true,
+        },
+        "collapsible-item:open" => SectionKind::CollapsibleListItem {
+            default_collapsed: false,
+        },
+        "collapsible-item:closed" => SectionKind::CollapsibleListItem {
             default_collapsed: true,
         },
         "item" => SectionKind::ListItem { checked: None },
@@ -1792,12 +1921,7 @@ fn project_tree(mut entries: Vec<Entry>) -> Vec<Entry> {
         let into_list = parent.is_some_and(|parent| {
             parent != usize::MAX && matches!(entries[parent].kind, SectionKind::List { .. })
         });
-        let kind = &mut entries[index].kind;
-        if into_list && matches!(kind, SectionKind::Text) {
-            *kind = SectionKind::ListItem { checked: None };
-        } else if !into_list && matches!(kind, SectionKind::ListItem { .. }) {
-            *kind = SectionKind::Text;
-        }
+        entries[index].kind = list_role(&entries[index].kind, into_list, false);
     }
     let mut children = vec![Vec::new(); entries.len()];
     let mut roots = Vec::new();
@@ -1926,7 +2050,8 @@ fn serialize_children(sections: &[Section], parent: Option<&str>) -> String {
                 })
                 .collect::<Vec<_>>()
                 .join("\n"),
-            SectionKind::Collapsible { default_collapsed } => {
+            SectionKind::Collapsible { default_collapsed }
+            | SectionKind::CollapsibleListItem { default_collapsed } => {
                 crate::block_markdown::collapsible_markdown(
                     &section.content,
                     &siblings(children, Some(&section.id)),

@@ -29,6 +29,31 @@ fn create(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<BlockEditor>, Str
     (handle, editor, title, body)
 }
 
+fn create_list(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<BlockEditor>, String, String) {
+    let (handle, editor, title) = setup("", cx);
+    cx.update_window(handle, |_, window, cx| {
+        select(&editor, &title, 0, 0, 0, window, cx);
+        window.render_frame(cx);
+        window.input("/collapsible-list", cx);
+    })
+    .unwrap();
+    cx.update_window(handle, |_, window, cx| {
+        window.press("enter", cx);
+        window.input("First", cx);
+    })
+    .unwrap();
+    let body = editor.read_with(cx, |editor, _| {
+        assert!(editor.error.is_none(), "{:?}", editor.error);
+        assert!(matches!(
+            editor.views[&title].kind,
+            SectionKind::CollapsibleListItem { .. }
+        ));
+        assert_eq!(editor.views[&title].content.plain_text(), "First");
+        editor.document.children(Some(&title))[0].id.clone()
+    });
+    (handle, editor, title, body)
+}
+
 #[gpui_kit::test]
 fn slash_collapsible_is_one_undo_group_and_redo_restores_the_subtree(cx: &mut TestAppContext) {
     let (handle, editor, title, body) = create(cx);
@@ -97,70 +122,76 @@ fn folding_hides_the_body_without_changing_shared_content(cx: &mut TestAppContex
 
 #[gpui_kit::test]
 fn replicas_fold_independently_and_hidden_bodies_receive_peer_edits(cx: &mut TestAppContext) {
-    let (left_handle, left, _title, body) = create(cx);
-    let (right_handle, right) = mount(replica(&left, cx), cx);
-    cx.update_window(right_handle, |_, window, cx| {
-        window.render_frame(cx);
-        assert!(
-            !window
-                .try_find(SharedString::from(body.clone()))
-                .is_some_and(|row| row.visible())
-        );
-        window.click(("toggle-collapse", 0usize), cx);
-        assert!(window.find(SharedString::from(body.clone())).visible());
-    })
-    .unwrap();
-    cx.update_window(left_handle, |_, window, cx| {
-        window.click(("toggle-collapse", 0usize), cx);
-        assert!(
-            !window
-                .try_find(SharedString::from(body.clone()))
-                .is_some_and(|row| row.visible())
-        );
-    })
-    .unwrap();
-    let vector = right.read_with(cx, |editor, _| editor.document.state_vector());
-    cx.update_window(right_handle, |_, window, cx| {
-        select(&right, &body, 0, 0, 0, window, cx);
-        window.render_frame(cx);
-        window.input("Peer-edited hidden content", cx);
-    })
-    .unwrap();
-    let update = right.read_with(cx, |editor, _| {
-        editor.document.encode_update(&vector).unwrap()
-    });
-    cx.update_window(left_handle, |_, window, cx| {
-        left.update(cx, |editor, cx| {
-            editor.apply_update(&update, window, cx).unwrap()
+    for collapsible_list in [false, true] {
+        let (left_handle, left, _title, body) = if collapsible_list {
+            create_list(cx)
+        } else {
+            create(cx)
+        };
+        let (right_handle, right) = mount(replica(&left, cx), cx);
+        cx.update_window(right_handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                !window
+                    .try_find(SharedString::from(body.clone()))
+                    .is_some_and(|row| row.visible())
+            );
+            window.click(("toggle-collapse", 0usize), cx);
+            assert!(window.find(SharedString::from(body.clone())).visible());
+        })
+        .unwrap();
+        cx.update_window(left_handle, |_, window, cx| {
+            window.click(("toggle-collapse", 0usize), cx);
+            assert!(
+                !window
+                    .try_find(SharedString::from(body.clone()))
+                    .is_some_and(|row| row.visible())
+            );
+        })
+        .unwrap();
+        let vector = right.read_with(cx, |editor, _| editor.document.state_vector());
+        cx.update_window(right_handle, |_, window, cx| {
+            select(&right, &body, 0, 0, 0, window, cx);
+            window.render_frame(cx);
+            window.input("Peer-edited hidden content", cx);
+        })
+        .unwrap();
+        let update = right.read_with(cx, |editor, _| {
+            editor.document.encode_update(&vector).unwrap()
         });
-        window.render_frame(cx);
-        assert!(
-            !window
-                .try_find(SharedString::from(body.clone()))
-                .is_some_and(|row| row.visible())
-        );
-        window.click(("toggle-collapse", 0usize), cx);
-        assert!(window.find(SharedString::from(body.clone())).visible());
-    })
-    .unwrap();
-    left.read_with(cx, |editor, cx| {
-        assert_eq!(
-            editor.views[&body]
-                .editor
-                .read(cx)
-                .model()
-                .rich_document()
-                .unwrap()
-                .plain_text(),
-            "Peer-edited hidden content"
-        );
-        assert!(editor.error.is_none(), "{:?}", editor.error);
-    });
-    cx.update_window(right_handle, |_, window, cx| {
-        window.render_frame(cx);
-        assert!(window.find(SharedString::from(body)).visible());
-    })
-    .unwrap();
+        cx.update_window(left_handle, |_, window, cx| {
+            left.update(cx, |editor, cx| {
+                editor.apply_update(&update, window, cx).unwrap()
+            });
+            window.render_frame(cx);
+            assert!(
+                !window
+                    .try_find(SharedString::from(body.clone()))
+                    .is_some_and(|row| row.visible())
+            );
+            window.click(("toggle-collapse", 0usize), cx);
+            assert!(window.find(SharedString::from(body.clone())).visible());
+        })
+        .unwrap();
+        left.read_with(cx, |editor, cx| {
+            assert_eq!(
+                editor.views[&body]
+                    .editor
+                    .read(cx)
+                    .model()
+                    .rich_document()
+                    .unwrap()
+                    .plain_text(),
+                "Peer-edited hidden content"
+            );
+            assert!(editor.error.is_none(), "{:?}", editor.error);
+        });
+        cx.update_window(right_handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find(SharedString::from(body)).visible());
+        })
+        .unwrap();
+    }
 }
 
 #[gpui_kit::test]
@@ -221,8 +252,8 @@ fn dragging_a_collapsible_title_moves_children_and_trash_undo_restores_them(
 }
 
 #[gpui_kit::test]
-fn dragging_a_collapsible_into_a_list_does_not_erase_its_container_kind(cx: &mut TestAppContext) {
-    let (handle, editor, title, _body) = create(cx);
+fn dragging_a_collapsible_into_and_out_of_a_list_preserves_its_body(cx: &mut TestAppContext) {
+    let (handle, editor, title, body) = create(cx);
     let target = cx
         .update_window(handle, |_, window, cx| {
             editor.update(cx, |editor, cx| {
@@ -235,16 +266,50 @@ fn dragging_a_collapsible_into_a_list_does_not_erase_its_container_kind(cx: &mut
     let before = editor.read_with(cx, |editor, _| editor.document.sections());
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
-        window.hover(SharedString::from(title), cx);
+        window.hover(SharedString::from(title.clone()), cx);
         let from = window.find(("grip", 0usize)).bounds().center();
-        let to = window.find(SharedString::from(target)).bounds().center();
+        let to = window
+            .find(SharedString::from(target.clone()))
+            .bounds()
+            .center();
         window.drag(from, to, cx);
     })
     .unwrap();
     editor.read_with(cx, |editor, _| {
-        assert_eq!(editor.document.sections(), before);
+        assert_eq!(editor.views[&title].parent, editor.views[&target].parent);
+        assert!(matches!(
+            editor.views[&title].kind,
+            SectionKind::CollapsibleListItem { .. }
+        ));
+        assert_eq!(editor.document.children(Some(&title))[0].id, body);
         assert!(editor.error.is_none(), "{:?}", editor.error);
     });
+    cx.update_window(handle, |_, window, cx| {
+        window.hover(SharedString::from(title.clone()), cx);
+        let from = window.find(("grip", 0usize)).bounds().center();
+        let to = window.find("append-section").bounds().center();
+        window.drag(from, to, cx);
+    })
+    .unwrap();
+    editor.read_with(cx, |editor, _| {
+        assert!(editor.views[&title].parent.is_none());
+        assert!(matches!(
+            editor.views[&title].kind,
+            SectionKind::Collapsible { .. }
+        ));
+        assert_eq!(editor.document.children(Some(&title))[0].id, body);
+    });
+    cx.update_window(handle, |_, window, cx| {
+        editor.update(cx, |editor, cx| {
+            assert!(editor.undo(window, cx).unwrap());
+            assert!(editor.undo(window, cx).unwrap());
+        });
+    })
+    .unwrap();
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.document.sections()),
+        before
+    );
 }
 
 #[gpui_kit::test]
@@ -433,4 +498,56 @@ fn keyboard_navigation_reveals_commands_beyond_the_initial_menu_viewport(cx: &mu
         ));
         assert!(editor.error.is_none(), "{:?}", editor.error);
     });
+}
+
+#[gpui_kit::test]
+fn collapsible_list_enter_creates_a_sibling_and_empty_enter_exits_with_undo(
+    cx: &mut TestAppContext,
+) {
+    let (handle, editor, title, body) = create_list(cx);
+    let original = editor.read_with(cx, |editor, _| editor.document.sections());
+    cx.update_window(handle, |_, window, cx| {
+        select(&editor, &title, 0, 5, 5, window, cx);
+        window.render_frame(cx);
+        window.press("enter", cx);
+    })
+    .unwrap();
+    let (next, next_body, split) = editor.read_with(cx, |editor, _| {
+        let group = editor.views[&title].parent.as_deref();
+        let items = editor.document.children(group);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].id, title);
+        assert_eq!(items[0].content.plain_text(), "First");
+        assert_eq!(editor.document.children(Some(&title))[0].id, body);
+        assert!(matches!(
+            items[1].kind,
+            SectionKind::CollapsibleListItem { .. }
+        ));
+        assert_eq!(items[1].content.plain_text(), "");
+        let body = editor.document.children(Some(&items[1].id))[0].id.clone();
+        assert!(!editor.is_collapsed(&items[1].id));
+        assert!(editor.error.is_none(), "{:?}", editor.error);
+        (items[1].id.clone(), body, editor.document.sections())
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find(SharedString::from(next_body.clone())).visible());
+        window.press("enter", cx);
+    })
+    .unwrap();
+    editor.read_with(cx, |editor, _| {
+        assert_eq!(editor.views[&next].kind, SectionKind::Text);
+        assert!(editor.views[&next].parent.is_none());
+        assert_eq!(editor.document.children(Some(&title))[0].id, body);
+        assert!(editor.error.is_none(), "{:?}", editor.error);
+    });
+    cx.update_window(handle, |_, window, cx| {
+        editor.update(cx, |editor, cx| {
+            assert!(editor.undo(window, cx).unwrap());
+            assert_eq!(editor.document.sections(), split);
+            assert!(editor.undo(window, cx).unwrap());
+            assert_eq!(editor.document.sections(), original);
+        });
+    })
+    .unwrap();
 }
