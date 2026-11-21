@@ -347,9 +347,28 @@ fn bare_slash_menu_scrolls_to_collapsible_and_accepts_a_mouse_click(cx: &mut Tes
     })
     .unwrap();
     cx.update_window(handle, |_, window, cx| {
+        let heading = window.find("slash-group-Text").bounds();
+        let paragraph = window.find("paragraph").bounds();
+        assert!(heading.bottom() <= paragraph.top());
+        let icon = window
+            .within("paragraph")
+            .find("slash-command-icon")
+            .bounds();
+        let label = window
+            .within("paragraph")
+            .find("slash-command-label")
+            .bounds();
+        assert!(icon.left() > heading.left());
+        assert!(icon.right() < label.left());
+        assert!(paragraph.contains(&icon.center()));
+        assert!(paragraph.contains(&label.center()));
+        let table_heading = window.find("slash-group-Table").bounds();
+        assert!(table_heading.bottom() <= window.find("table").bounds().top());
+        let viewport = window.find("slash-menu-items").bounds();
+        let command = window.find("collapsible").bounds();
         window.scroll(
             "slash-menu-items",
-            ScrollDelta::Pixels(point(px(0.), px(-2000.))),
+            ScrollDelta::Pixels(point(px(0.), viewport.bottom() - command.bottom() - px(4.))),
             cx,
         );
         let viewport = window.find("slash-menu-items").bounds();
@@ -390,6 +409,16 @@ fn keyboard_navigation_reveals_commands_beyond_the_initial_menu_viewport(cx: &mu
     cx.update_window(handle, |_, window, cx| {
         for _ in 0..index {
             window.press("down", cx);
+            let selected = editor.read_with(cx, |editor, _| {
+                let menu = editor.completion.as_ref().unwrap();
+                menu.commands[menu.selected].id.clone()
+            });
+            assert!(
+                window
+                    .find("slash-menu-items")
+                    .bounds()
+                    .contains(&window.find(SharedString::from(selected)).bounds().center())
+            );
         }
         let viewport = window.find("slash-menu-items").bounds();
         let command = window.find("collapsible").bounds();

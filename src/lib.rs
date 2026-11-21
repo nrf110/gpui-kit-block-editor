@@ -6,6 +6,8 @@ mod block_markdown;
 pub mod document;
 pub mod editor;
 pub mod extension;
+pub mod media;
+mod media_view;
 mod rich_map;
 
 pub use block::{BlockSpec, SectionKind};
@@ -18,8 +20,12 @@ pub use markdown_editor::rich::{
     RICH_DOCUMENT_VERSION, RichAtom, RichDocument, RichKind, RichLength, RichLink, RichMarks,
     RichNode, RichRun, register_custom_codec,
 };
+pub use media::{FileMediaStore, MediaAttachment, MediaKind, MediaStore};
 
 /// Call after `gpui_kit::init`, before constructing editors.
 pub fn init(cx: &mut gpui_kit::App) {
     markdown_editor::init(cx);
 }
+
+#[cfg(test)]
+mod media_tests;

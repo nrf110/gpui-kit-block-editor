@@ -428,13 +428,28 @@ fn plus_menu_preserves_selected_text_and_escape_does_not_edit(cx: &mut TestAppCo
             window.find(SharedString::from(id.clone())).bounds(),
             row_bounds
         );
-        assert!(window.find("bold").visible());
         assert_eq!(editor.read(cx).document.state_vector(), vector);
         window.press("escape", cx);
         assert!(editor.read(cx).completion.is_none());
         assert_eq!(editor.read(cx).document.state_vector(), vector);
         window.hover(SharedString::from(id.clone()), cx);
         window.click(("block-menu", 0usize), cx);
+        let viewport = window.find("slash-menu-items").bounds();
+        let command = window.find("bold").bounds();
+        window.scroll(
+            "slash-menu-items",
+            ScrollDelta::Pixels(point(
+                px(0.),
+                (viewport.bottom() - command.bottom() - px(4.)).min(px(0.)),
+            )),
+            cx,
+        );
+        assert!(
+            window
+                .find("slash-menu-items")
+                .bounds()
+                .contains(&window.find("bold").bounds().center())
+        );
         window.click("bold", cx);
     })
     .unwrap();

@@ -21,6 +21,8 @@ fn extensions() -> ExtensionRegistry {
         .register(SlashCommand {
             id: "callout".into(),
             title: "Callout".into(),
+            group: "Layout".into(),
+            icon: gpui_kit::assets::IconName::MessageSquareText,
             description: "An application-defined extension".into(),
             keywords: vec!["note".into(), "custom".into()],
             action: CommandAction::InsertMarkdown(

@@ -1,14 +1,55 @@
-use std::sync::Arc;
+use std::{collections::HashMap, fmt, sync::Arc};
 
+use crate::media::{FileMediaStore, MediaKind, MediaStore};
 use anyhow::{Context, Result, ensure};
+use gpui_kit::assets::IconName;
+use gpui_kit::{AssetSource, component::Icon};
 use markdown_editor::rich::{RichDocument, RichKind, RichNode};
 use markdown_editor::{BlockKind, EditorCommand, MarkKind, TableEdit};
+
+// Keep the component self-contained: these glyphs are not in GPUI Kit's default bundle.
+gpui_kit::assets::icon_assets!(
+    CommandIcons,
+    [
+        Type,
+        Heading1,
+        Heading2,
+        Heading3,
+        Bold,
+        Italic,
+        Strikethrough,
+        Code,
+        List,
+        ListOrdered,
+        ListTodo,
+        TextQuote,
+        SquareCode,
+        Table,
+        BetweenHorizontalStart,
+        BetweenHorizontalEnd,
+        Rows3,
+        BetweenVerticalStart,
+        BetweenVerticalEnd,
+        Columns3,
+        ListCollapse,
+        Image,
+        Video,
+        Music,
+        File,
+        Workflow,
+        MessageSquareText,
+    ]
+);
 
 /// An executable item in the editor's slash menu.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SlashCommand {
     pub id: String,
     pub title: String,
+    /// Menu heading. Matching labels share a group, including host-defined commands.
+    pub group: String,
+    /// Bundled icon displayed beside the command's title and description.
+    pub icon: IconName,
     pub description: String,
     pub keywords: Vec<String>,
     pub action: CommandAction,
@@ -19,6 +60,7 @@ pub enum CommandAction {
     Editor(EditorCommand),
     InsertMarkdown(String),
     Collapsible,
+    InsertMedia(MediaKind),
 }
 
 #[derive(Clone, Debug)]
@@ -27,15 +69,29 @@ struct IndexedCommand {
     search_text: String,
 }
 
-/// Commands retain registration order, including when a search has multiple matches.
-#[derive(Clone, Debug)]
+/// Groups retain first-registration order; commands retain registration order within a group.
+#[derive(Clone)]
 pub struct CommandRegistry {
     commands: Vec<IndexedCommand>,
+    icons: HashMap<IconName, Icon>,
+}
+
+impl fmt::Debug for CommandRegistry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CommandRegistry")
+            .field("commands", &self.commands)
+            .finish_non_exhaustive()
+    }
 }
 
 impl CommandRegistry {
     /// Register a command without replacing an existing command with the same ID.
     pub fn register(&mut self, command: SlashCommand) -> Result<()> {
+        ensure!(
+            !command.group.trim().is_empty(),
+            "a command group must not be empty"
+        );
         ensure!(
             !self
                 .commands
@@ -44,17 +100,33 @@ impl CommandRegistry {
             "a slash command with ID {:?} is already registered",
             command.id
         );
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.icons.entry(command.icon) {
+            let icon = match CommandIcons.load(command.icon.path().as_ref())? {
+                Some(bytes) => Icon::default().data(&bytes),
+                None => Icon::new(command.icon),
+            };
+            entry.insert(icon);
+        }
         let search_text = std::iter::once(command.id.as_str())
             .chain(std::iter::once(command.title.as_str()))
             .chain(std::iter::once(command.description.as_str()))
+            .chain(std::iter::once(command.group.as_str()))
             .chain(command.keywords.iter().map(String::as_str))
             .flat_map(|text| text.chars().chain(std::iter::once(' ')))
             .flat_map(char::to_lowercase)
             .collect();
-        self.commands.push(IndexedCommand {
-            command,
-            search_text,
-        });
+        let index = self
+            .commands
+            .iter()
+            .rposition(|entry| entry.command.group == command.group)
+            .map_or(self.commands.len(), |index| index + 1);
+        self.commands.insert(
+            index,
+            IndexedCommand {
+                command,
+                search_text,
+            },
+        );
         Ok(())
     }
 
@@ -72,18 +144,56 @@ impl CommandRegistry {
             .map(|entry| entry.command.clone())
             .collect()
     }
+
+    pub(crate) fn icon(&self, name: IconName) -> Icon {
+        self.icons[&name].clone()
+    }
 }
 
 impl Default for CommandRegistry {
     fn default() -> Self {
         let mut registry = Self {
             commands: Vec::new(),
+            icons: HashMap::new(),
         };
         let mut add = |id: &str, title: &str, description: &str, keywords: &[&str], action| {
+            let group = match &action {
+                EditorCommand::ToggleList { .. } | EditorCommand::ToggleTask => "Lists",
+                EditorCommand::InsertTable { .. } | EditorCommand::EditTable(_) => "Table",
+                _ => "Text",
+            };
+            let icon = match &action {
+                EditorCommand::SetBlockKind(BlockKind::Heading { level: 1 }) => IconName::Heading1,
+                EditorCommand::SetBlockKind(BlockKind::Heading { level: 2 }) => IconName::Heading2,
+                EditorCommand::SetBlockKind(BlockKind::Heading { level: 3 }) => IconName::Heading3,
+                EditorCommand::ToggleMark(MarkKind::Bold) => IconName::Bold,
+                EditorCommand::ToggleMark(MarkKind::Italic) => IconName::Italic,
+                EditorCommand::ToggleMark(MarkKind::Strikethrough) => IconName::Strikethrough,
+                EditorCommand::ToggleMark(MarkKind::Code) => IconName::Code,
+                EditorCommand::ToggleList { ordered: false } => IconName::List,
+                EditorCommand::ToggleList { ordered: true } => IconName::ListOrdered,
+                EditorCommand::ToggleTask => IconName::ListTodo,
+                EditorCommand::ToggleBlockquote => IconName::TextQuote,
+                EditorCommand::SetCodeBlock { .. } => IconName::SquareCode,
+                EditorCommand::InsertTable { .. } => IconName::Table,
+                EditorCommand::EditTable(TableEdit::AddRowAbove) => {
+                    IconName::BetweenHorizontalStart
+                }
+                EditorCommand::EditTable(TableEdit::AddRowBelow) => IconName::BetweenHorizontalEnd,
+                EditorCommand::EditTable(TableEdit::RemoveRow) => IconName::Rows3,
+                EditorCommand::EditTable(TableEdit::AddColumnLeft) => {
+                    IconName::BetweenVerticalStart
+                }
+                EditorCommand::EditTable(TableEdit::AddColumnRight) => IconName::BetweenVerticalEnd,
+                EditorCommand::EditTable(TableEdit::RemoveColumn) => IconName::Columns3,
+                _ => IconName::Type,
+            };
             registry
                 .register(SlashCommand {
                     id: id.into(),
                     title: title.into(),
+                    group: group.into(),
+                    icon,
                     description: description.into(),
                     keywords: keywords.iter().map(|word| (*word).into()).collect(),
                     action: CommandAction::Editor(action),
@@ -234,11 +344,60 @@ impl Default for CommandRegistry {
             .register(SlashCommand {
                 id: "collapsible".into(),
                 title: "Collapsible section".into(),
+                group: "Layout".into(),
+                icon: IconName::ListCollapse,
                 description: "Group content under an expandable title".into(),
                 keywords: vec!["toggle".into(), "details".into(), "section".into()],
                 action: CommandAction::Collapsible,
             })
             .expect("the built-in collapsible command ID is unique");
+        for (id, title, description, keywords, kind) in [
+            (
+                "image",
+                "Image",
+                "Choose an image to preview",
+                &["photo", "picture", "media"][..],
+                MediaKind::Image,
+            ),
+            (
+                "video",
+                "Video",
+                "Attach a video",
+                &["movie", "clip", "media"][..],
+                MediaKind::Video,
+            ),
+            (
+                "audio",
+                "Audio",
+                "Attach audio",
+                &["sound", "music", "media"][..],
+                MediaKind::Audio,
+            ),
+            (
+                "file",
+                "File",
+                "Attach a PDF, Word document, or other file",
+                &["attachment", "pdf", "document", "media"][..],
+                MediaKind::File,
+            ),
+        ] {
+            registry
+                .register(SlashCommand {
+                    id: id.into(),
+                    title: title.into(),
+                    group: "Media".into(),
+                    icon: match kind {
+                        MediaKind::Image => IconName::Image,
+                        MediaKind::Video => IconName::Video,
+                        MediaKind::Audio => IconName::Music,
+                        MediaKind::File => IconName::File,
+                    },
+                    description: description.into(),
+                    keywords: keywords.iter().map(|word| (*word).into()).collect(),
+                    action: CommandAction::InsertMedia(kind),
+                })
+                .expect("built-in media command IDs are unique");
+        }
         registry
     }
 }
@@ -273,6 +432,7 @@ struct RegisteredPreview {
 pub struct ExtensionRegistry {
     pub commands: CommandRegistry,
     previews: Vec<RegisteredPreview>,
+    pub(crate) media_store: Arc<dyn MediaStore>,
 }
 
 impl Default for ExtensionRegistry {
@@ -280,6 +440,7 @@ impl Default for ExtensionRegistry {
         let mut registry = Self {
             commands: CommandRegistry::default(),
             previews: Vec::new(),
+            media_store: Arc::new(FileMediaStore::default()),
         };
         registry
             .register_preview(MermaidExtension)
@@ -287,6 +448,8 @@ impl Default for ExtensionRegistry {
         registry.commands.register(SlashCommand {
             id: "mermaid".into(),
             title: "Mermaid diagram".into(),
+            group: "Diagrams".into(),
+            icon: IconName::Workflow,
             description: "Insert a natively rendered flowchart".into(),
             keywords: vec!["diagram".into(), "flowchart".into(), "graph".into()],
             action: CommandAction::InsertMarkdown(
@@ -298,6 +461,13 @@ impl Default for ExtensionRegistry {
 }
 
 impl ExtensionRegistry {
+    /// Configure managed attachments before constructing an editor.
+    /// Hosts distribute asset files separately from CRDT metadata updates.
+    pub fn with_media_store(mut self, store: Arc<dyn MediaStore>) -> Self {
+        self.media_store = store;
+        self
+    }
+
     /// Code language matching and duplicate detection are ASCII case-insensitive.
     pub fn register_preview(&mut self, extension: impl PreviewExtension + 'static) -> Result<()> {
         let language = extension.language();
@@ -364,6 +534,8 @@ mod tests {
         SlashCommand {
             id: "custom-note".into(),
             title: "Custom note".into(),
+            group: "Callouts".into(),
+            icon: IconName::MessageSquareText,
             description: "Insert an application-specific note".into(),
             keywords: vec!["admonition".into()],
             action: CommandAction::InsertMarkdown("> Note\n".into()),
@@ -398,6 +570,34 @@ mod tests {
         assert!(registry.register(duplicate).is_err());
         assert_eq!(registry.search("").len(), count);
         assert_eq!(registry.search("admonition"), vec![command]);
+    }
+
+    #[test]
+    fn late_extensions_join_existing_groups_and_group_names_are_searchable() {
+        let mut registry = CommandRegistry::default();
+        let mut callout = custom_command();
+        callout.group = "Text".into();
+        registry.register(callout.clone()).unwrap();
+        let commands = registry.search("");
+        let index = commands
+            .iter()
+            .position(|command| command.id == callout.id)
+            .unwrap();
+        assert_eq!(commands[index - 1].group, "Text");
+        assert_eq!(commands[index + 1].group, "Lists");
+        let text = registry.search("/TEXT");
+        assert!(text.contains(&callout));
+        assert!(text.iter().all(|command| command.group == "Text"));
+
+        let mut custom = SlashCommand {
+            id: "host-note".into(),
+            ..custom_command()
+        };
+        registry.register(custom.clone()).unwrap();
+        assert_eq!(registry.search("Callouts"), vec![custom.clone()]);
+        custom.id = "another-host-note".into();
+        registry.register(custom.clone()).unwrap();
+        assert_eq!(registry.search("").last(), Some(&custom));
     }
 
     #[test]

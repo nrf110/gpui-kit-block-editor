@@ -134,6 +134,7 @@ fn read_runs<T: ReadTxn>(text: &TextRef, txn: &T) -> Result<Vec<RichRun>> {
         }
         let marks: RichMarks = serde_json::from_value(marks)?;
         if let Some(atom) = atom {
+            crate::media::validate_media_atom(&atom)?;
             ensure!(
                 !value.is_empty() && value.chars().all(|ch| ch == '\u{FFFC}'),
                 "atom metadata requires object replacement characters"
@@ -453,6 +454,7 @@ pub(super) fn validate_schema(doc: &Doc, require_version: bool) -> Result<()> {
             let body = body(&section, &txn)?;
             let content = read_content(&body, &txn)?;
             content.validate().map_err(|error| anyhow!("{error}"))?;
+            crate::media::validate_media_content(&content)?;
             let encoded = string(&section, &txn, "kind")?;
             ensure!(
                 super::encode_kind(&super::read_kind(&section, &txn)) == encoded,

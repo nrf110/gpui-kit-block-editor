@@ -426,6 +426,7 @@ impl Document {
 
     pub fn set_content(&mut self, id: &str, content: &RichDocument) -> Result<()> {
         content.validate().map_err(|error| anyhow!("{error}"))?;
+        crate::media::validate_media_content(content)?;
         let body = {
             let txn = self.doc.transact();
             let section = self.section_map(&txn, id)?;
@@ -997,6 +998,7 @@ impl Document {
                 .content
                 .validate()
                 .map_err(|error| anyhow!("{error}"))?;
+            crate::media::validate_media_content(&section.content)?;
             ensure!(
                 section.kind.is_editable() || section.content.plain_text().is_empty(),
                 "container text must be empty"
@@ -1610,6 +1612,7 @@ fn validate_spec(spec: &BlockSpec) -> Result<()> {
     spec.content
         .validate()
         .map_err(|error| anyhow!("{error}"))?;
+    crate::media::validate_media_content(&spec.content)?;
     ensure!(
         spec.kind.is_editable() || spec.content.plain_text().is_empty(),
         "container text must be empty"

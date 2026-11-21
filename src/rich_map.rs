@@ -112,7 +112,11 @@ impl RichMap {
             boundaries.push(text.len());
         } else {
             ensure!(
-                node.runs.is_empty(),
+                node.runs.is_empty()
+                    || (atomic
+                        && node.kind == RichKind::Custom
+                        && matches!(node.runs.as_slice(), [run] if run.text == "\u{FFFC}"
+                            && matches!(run.atom, Some(markdown_editor::rich::RichAtom::Custom { .. })))),
                 "non-text native node has semantic text"
             );
             boundaries.push(0);

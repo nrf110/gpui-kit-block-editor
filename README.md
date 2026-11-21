@@ -37,6 +37,10 @@ The backend is a vendored extension of [gpui-kit-markdown-editor 0.3.0](https://
 - Click **+** to the left of a block's grip, or type **/**, to open the command menu. Opening with **+** preserves the text and selection without inserting a slash; formatting commands apply to that selection. The **+** menu floats beside its button without moving the block. Wheel scrolling stays inside either menu, including at its scroll limits. Scroll to browse every command, or type **/** and keep typing to filter. **Up/Down** keeps the selected command in view; **Enter/Tab** accepts it and **Escape** dismisses the menu. Commands include headings, marks, lists/tasks, quotes, tables and cell operations, code, Mermaid, and collapsible sections. IME composition is not intercepted.
 - **Cmd/Ctrl+B / I** applies styling. **Cmd/Ctrl+Z / Shift+Z** undoes/redoes this replica's edits without undoing peers' changes. Heading levels provide font sizes; arbitrary font families/point sizes are not exposed by the current native renderer.
 
+The command menu groups related actions under **Text**, **Lists**, **Table**, **Layout**, **Media**, and **Diagrams**. Headings are not selectable; keyboard navigation moves between commands and keeps them visible. Search matches both commands and their group names, hiding empty groups. Host extensions set `SlashCommand.group` to join an existing heading or introduce a new one. Groups follow first-registration order, with commands in registration order within each group.
+
+Group headings are larger and semibold; indented command rows pair a muted icon with a title and description. `SlashCommand.icon` selects a `gpui_kit::assets::IconName`. Built-in command glyphs are embedded by the editor and cached at registration, so hosts do not need to configure extra assets for them. Hosts choosing other catalog icons must include those icons in their application's asset source.
+
 ### Selection toolbar
 
 Highlight text to show a floating toolbar above the selected glyphs. It follows wrapping and scrolling without moving the document, and flips below the selection when there is no room above. The toolbar offers paragraph/heading 1–6 presets, bold, italic, underline, quote, link editing, collapsible sections, and bulleted, numbered, or task lists.
@@ -66,6 +70,26 @@ These are explicit title/body containers, not ranges inferred from the next head
 **/mermaid** inserts a code block with semantic language `mermaid` and opens its native SVG preview. Hover for the source/preview toggle immediately left of the trash icon. Only one view is shown at a time; source edits refresh the preview asynchronously. Errors remain switchable back to source.
 
 Preview mode is local to each editor. Diagrams work inside lists, quotes, and collapsibles. Rendering uses [mermaid-rs-renderer](https://github.com/1jehuang/mermaid-rs-renderer), without Node or a browser; syntax/fidelity follow that renderer rather than full Mermaid.js parity.
+
+### Media attachments
+
+Use **/image**, **/video**, **/audio**, or **/file**, or choose **Image**, **Video**, **Audio**, or **File** from a block's **+** menu. The native file picker accepts multiple files. Cancelling leaves the document unchanged. Images preview inline with their aspect ratio preserved; video, audio, PDFs, Word documents, and other files appear as attachment cards. **Open** uses the system's associated application; **Save** exports a copy. Executable/active and unknown file types can be saved but cannot be opened directly from the editor.
+
+Drag files from the filesystem onto a block to insert before it, onto a list boundary to use that group, or into unused editor space to append at the top level. Types are inferred from file signatures and extensions. Directories and symlinks are rejected. A batch preserves file order and is one collaborative undo step. Imported media blocks retain the existing drag, nesting, selection, and trash controls. File reads/copies and asset resolution run off the UI thread.
+
+Files are copied into managed storage, so moving/deleting the original does not break the attachment. Only versioned metadata (asset UUID, kind, filename, MIME type, and byte length) is stored in a native custom block and replicated through CRDT updates/JSON. Absolute paths and file bytes are not replicated. Markdown export produces `asset://<UUID>` links, not a self-contained media bundle or an attachment-metadata roundtrip.
+
+The default store uses the persistent user-data directory (`~/Library/Application Support/gpui-kit-block-editor/media` on macOS). Configure an application-owned directory before constructing the editor:
+
+```rust
+use std::sync::Arc;
+use gpui_kit_block_editor::{ExtensionRegistry, FileMediaStore};
+
+let extensions = ExtensionRegistry::default()
+    .with_media_store(Arc::new(FileMediaStore::new("/path/to/application/assets")));
+```
+
+Implement `MediaStore` for other backends. Its blocking operations are dispatched to the background executor by the component. Multiplayer hosts must upload/distribute assets separately, using `FileMediaStore::install_file(&attachment, path)` to fulfil a peer reference without changing its UUID. Missing assets show a **Retry** control after the host supplies them. Removing/undoing an attachment changes references, not stored bytes; the host owns retention and garbage collection, including assets still referenced by saved documents or undo history.
 
 ## Embed
 

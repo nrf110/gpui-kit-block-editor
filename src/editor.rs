@@ -31,10 +31,14 @@ use crate::{
     extension::{CommandAction, ExtensionRegistry, SlashCommand},
     rich_map::{RichMap, RichPoint, SelectionKind, SelectionOffsets},
 };
+use crate::{media::MediaAttachment, media_view::MediaView};
 
 #[path = "selection_toolbar.rs"]
 mod selection_toolbar;
 use selection_toolbar::{SelectionDropdown, SelectionLink};
+
+#[path = "media_editor.rs"]
+mod media_editor;
 
 /// Raw Yjs v1 updates. Remote application never echoes a local event.
 #[derive(Clone, Debug)]
@@ -177,6 +181,7 @@ struct SectionView {
     last_origin: Option<EditOrigin>,
     _subscription: Subscription,
     preview_task: Option<Task<()>>,
+    media: Option<(MediaAttachment, Entity<MediaView>)>,
 }
 
 struct Completion {
@@ -188,6 +193,20 @@ struct Completion {
     commands: Vec<SlashCommand>,
     selected: usize,
     scroll: ScrollHandle,
+}
+
+impl Completion {
+    fn scroll_to_selected(&self) {
+        // Headings occupy scroll children but are not keyboard-selectable commands.
+        let headings = self.commands[..=self.selected]
+            .iter()
+            .enumerate()
+            .filter(|(index, command)| {
+                *index == 0 || self.commands[index - 1].group != command.group
+            })
+            .count();
+        self.scroll.scroll_to_item(self.selected + headings);
+    }
 }
 
 #[derive(Clone)]
@@ -256,6 +275,7 @@ pub struct BlockEditor {
     pending_remote: Vec<PendingRemote>,
     pending_task: Option<Task<()>>,
     composition_group: Option<SectionId>,
+    media_imports: usize,
     _keystrokes: Subscription,
 }
 impl EventEmitter<DocumentEvent> for BlockEditor {}
@@ -339,6 +359,7 @@ impl BlockEditor {
             pending_remote: Vec::new(),
             pending_task: None,
             composition_group: None,
+            media_imports: 0,
             _keystrokes: keystrokes,
         };
         this.reconcile(window, cx);
@@ -765,12 +786,12 @@ impl BlockEditor {
             "escape" => self.completion = None,
             "down" if !completion.commands.is_empty() => {
                 completion.selected = (completion.selected + 1) % completion.commands.len();
-                completion.scroll.scroll_to_item(completion.selected);
+                completion.scroll_to_selected();
             }
             "up" if !completion.commands.is_empty() => {
                 completion.selected = (completion.selected + completion.commands.len() - 1)
                     % completion.commands.len();
-                completion.scroll.scroll_to_item(completion.selected);
+                completion.scroll_to_selected();
             }
             "enter" | "tab" if !completion.commands.is_empty() => {
                 let index = completion.selected;
@@ -1032,6 +1053,7 @@ impl BlockEditor {
         view.last_origin = origin;
         if let Some(vector) = vector {
             self.schedule_preview(id, cx);
+            self.sync_media_view(id, window, cx);
             self.publish(&vector, cx);
         }
         if changed && isolated {
@@ -1446,6 +1468,7 @@ impl BlockEditor {
                         last_origin: None,
                         _subscription: subscription,
                         preview_task: None,
+                        media: None,
                     },
                 );
                 changed.push(section.id);
@@ -1456,6 +1479,7 @@ impl BlockEditor {
         }
         for id in changed {
             self.schedule_preview(&id, cx);
+            self.sync_media_view(&id, window, cx);
         }
         if let Some((index, _)) = focused.filter(|(_, id)| !self.views.contains_key(id)) {
             if let Some(id) = self
@@ -1642,24 +1666,26 @@ impl BlockEditor {
         );
         self.document.begin_history_group();
         let result = (|| -> anyhow::Result<()> {
-            let native = editor.update(cx, |state, cx| -> anyhow::Result<()> {
-                if let Some(range) = &mut range {
-                    state
-                        .replace_captured(range, "", cx)
-                        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-                }
-                if let CommandAction::Editor(command) = &action {
-                    if !structural {
+            if !matches!(&action, CommandAction::InsertMedia(_)) {
+                let native = editor.update(cx, |state, cx| -> anyhow::Result<()> {
+                    if let Some(range) = &mut range {
                         state
-                            .run(command.clone(), cx)
+                            .replace_captured(range, "", cx)
                             .map_err(|error| anyhow::anyhow!("{error:?}"))?;
                     }
-                }
-                state.focus(window, cx);
-                Ok(())
-            });
-            self.sync_native_change(id, Some(EditOrigin::Command("format")), window, cx)?;
-            native?;
+                    if let CommandAction::Editor(command) = &action {
+                        if !structural {
+                            state
+                                .run(command.clone(), cx)
+                                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                        }
+                    }
+                    state.focus(window, cx);
+                    Ok(())
+                });
+                self.sync_native_change(id, Some(EditOrigin::Command("format")), window, cx)?;
+                native?;
+            }
             match action {
                 CommandAction::InsertMarkdown(markdown) => {
                     self.insert_markup_after(id, &markdown, window, cx)?
@@ -1692,6 +1718,9 @@ impl BlockEditor {
                     self.publish(&vector, cx);
                 }
                 CommandAction::Editor(_) => {}
+                CommandAction::InsertMedia(kind) => {
+                    self.prompt_media(id, kind, range.take(), window, cx)?;
+                }
             }
             Ok(())
         })();
@@ -1749,13 +1778,63 @@ impl BlockEditor {
             items = items.child(div().p_2().child("No matching commands"));
         }
         for (index, command) in completion.commands.iter().enumerate() {
+            if index == 0 || completion.commands[index - 1].group != command.group {
+                let heading = div()
+                    .id(SharedString::from(format!("slash-group-{}", command.group)))
+                    .flex_shrink_0()
+                    .px_3()
+                    .pt_3()
+                    .pb_1()
+                    .text_base()
+                    .font_semibold()
+                    .text_color(cx.theme().popover_foreground)
+                    .child(command.group.clone());
+                #[cfg(test)]
+                let heading = {
+                    use gpui_kit::test::TestSupportExt;
+                    heading.test_support()
+                };
+                items = items.child(heading);
+            }
+            let icon = div()
+                .id("slash-command-icon")
+                .size_6()
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(cx.theme().muted_foreground)
+                .child(self.extensions.commands.icon(command.icon).size(px(20.)));
+            let label = div()
+                .id("slash-command-label")
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .child(div().text_sm().font_medium().child(command.title.clone()))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(command.description.clone()),
+                );
+            #[cfg(test)]
+            let (icon, label) = {
+                use gpui_kit::test::TestSupportExt;
+                (icon.test_support(), label.test_support())
+            };
             let row =
                 div()
                     .id(SharedString::from(command.id.clone()))
                     .flex_shrink_0()
-                    .px_3()
+                    .pl_6()
+                    .pr_3()
                     .py_2()
                     .rounded_md()
+                    .flex()
+                    .items_center()
+                    .gap_3()
                     .when(index == selected, |el| el.bg(cx.theme().accent))
                     .hover(|el| el.bg(cx.theme().accent))
                     .cursor_pointer()
@@ -1764,13 +1843,8 @@ impl BlockEditor {
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.accept_completion(index, window, cx)
                     }))
-                    .child(div().text_sm().font_medium().child(command.title.clone()))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(command.description.clone()),
-                    );
+                    .child(icon)
+                    .child(label);
             #[cfg(test)]
             let row = {
                 use gpui_kit::test::TestSupportExt;
@@ -1966,6 +2040,7 @@ impl BlockEditor {
         target: DropTarget,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
+        let media_target = target.clone();
         let owner = cx.entity_id();
         let hover_owner = cx.weak_entity();
         let hover_target = target.clone();
@@ -1982,6 +2057,9 @@ impl BlockEditor {
                 }
             })
             .can_drop(move |value, _, cx| {
+                if value.downcast_ref::<ExternalPaths>().is_some() {
+                    return true;
+                }
                 value
                     .downcast_ref::<DraggedSection>()
                     .is_some_and(|dragged| {
@@ -1995,6 +2073,11 @@ impl BlockEditor {
                     this.drop_sections(dragged, &target, window, cx);
                 }),
             )
+            .drag_over::<ExternalPaths>(|style, _, _, cx| style.bg(cx.theme().secondary))
+            .on_drop(cx.listener(move |this, paths: &ExternalPaths, window, cx| {
+                cx.stop_propagation();
+                this.import_dropped_media(paths.paths().to_vec(), media_target.clone(), window, cx);
+            }))
     }
 
     fn drop_zone(
@@ -2076,6 +2159,7 @@ impl Render for BlockEditor {
             let id = id.clone();
             let view = &self.views[&id];
             let editor = view.editor.clone();
+            let media = view.media.as_ref().map(|(_, view)| view.clone());
             let preview = view.preview.clone();
             let preview_error = view.preview_error.clone();
             let previewable = view.previewable;
@@ -2162,7 +2246,15 @@ impl Render for BlockEditor {
                 use gpui_kit::test::TestSupportExt;
                 grip.test_support()
             };
-            let body = if show_source {
+            let body = if let Some(media) = media {
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .px_3()
+                    .py_1()
+                    .child(media)
+                    .when_some(menu, |el, menu| el.child(menu))
+            } else if show_source {
                 let source = div()
                     .id(("section-source", index))
                     .px_3()
@@ -2463,6 +2555,15 @@ impl Render for BlockEditor {
             .when_some(self.error.clone(), |el, error| {
                 el.child(div().p_3().text_color(cx.theme().danger).child(error))
             })
+            .when(self.media_imports > 0, |el| {
+                el.child(
+                    div()
+                        .id("media-import-status")
+                        .p_3()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Importing attachments…"),
+                )
+            })
             .child(
                 div()
                     .id("document-scroll")
@@ -2471,6 +2572,19 @@ impl Render for BlockEditor {
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll)
                     .p_5()
+                    .can_drop(|value, _, _| value.downcast_ref::<ExternalPaths>().is_some())
+                    .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                        cx.stop_propagation();
+                        this.import_dropped_media(
+                            paths.paths().to_vec(),
+                            DropTarget {
+                                parent: None,
+                                before: None,
+                            },
+                            window,
+                            cx,
+                        );
+                    }))
                     .child(content),
             )
             .when_some(self.selection_toolbar(window, cx), |el, toolbar| {
@@ -2510,3 +2624,7 @@ mod merge_editor_tests;
 #[cfg(test)]
 #[path = "table_editor_tests.rs"]
 mod table_editor_tests;
+
+#[cfg(test)]
+#[path = "media_editor_tests.rs"]
+mod media_editor_tests;
