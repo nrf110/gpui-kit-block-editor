@@ -313,6 +313,10 @@ Native headless GPUI tests exercise typed editing, literal Markdown text, rich/e
 
 Model tests cover independent formatting/text merges, real shared-text identity, semantic tree ordering, unsupported-version rejection without partial changes, JSON boundaries, conflicts, and sync framing. Markdown boundary tests cover semantic import/export, definitions, whitespace normalization, lists, quotes, and collapsible roundtrips.
 
+## Releases
+
+GitHub Actions runs macOS formatting, native tests, demo compilation, and a verified `cargo publish --dry-run`. Release-plz prepares reviewed version/changelog PRs after main-branch checks pass. Publishing, tags, and GitHub Releases are disabled during bootstrap. See [the release guide](docs/RELEASING.md) for the GitHub App, branch protection, first publication, trusted publishing, and the explicit enablement steps.
+
 ## License and attribution
 
 This crate is licensed under Apache-2.0. The incorporated native editing engine retains its upstream attribution and license in `NOTICE` and `LICENSE-APACHE`; modified source files identify the integration changes. The unused upstream standalone wrapper and formatting toolbar are not included. The retained native engine tests run as part of `cargo test --lib`.
